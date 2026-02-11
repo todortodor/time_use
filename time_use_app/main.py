@@ -59,7 +59,7 @@ DEFAULTS: Dict[str, object] = {
     # human capital grid
     "h_min": 0.2,
     "h_max": 5.0,
-    "n_h": 60,
+    "n_h": 10,
     "x_axis": "log",  # "log" or "level"
 
     # wage mapping y(h) = w0 * h^w_elast
