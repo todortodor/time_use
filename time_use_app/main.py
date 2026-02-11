@@ -401,7 +401,7 @@ class ScenarioUI:
         add_float("h_max", "h_max")
         add_int("n_h", "n_h")
         add_float("w0", "w0 (wage scale)")
-        add_float("w_elast", "w_elast (wage elasticity)")
+        add_float("w_elast", "w_elast (wage elasticity - irrelevant)")
 
         # exogenous
         add_float("pc", "pc (care price)")
@@ -411,11 +411,11 @@ class ScenarioUI:
         # home productivity
         add_float("A_c0", "A_c0")
         add_float("A_d0", "A_d0")
-        add_float("A_c_elast", "A_c_elast")
-        add_float("A_d_elast", "A_d_elast")
+        add_float("A_c_elast", "A_c_elast - irrelevant")
+        add_float("A_d_elast", "A_d_elast - irrelevant")
 
         # participation smoothing
-        add_float("sigma_part", "sigma_part (logit scale)")
+        add_float("sigma_part", "sigma_part (logit scale) - prob irrelevant")
 
         # solver controls
         add_float("fp_tol", "fp_tol")
@@ -591,7 +591,7 @@ class ScenarioUI:
 
         exog_box = column(
             section("Exogenous"),
-            row(w["w0"], w["w_elast"]),
+            row(w["w0"]),# w["w_elast"]),
             row(w["pc"], w["pd"]),
             row(w["a"]),
         )
@@ -599,7 +599,7 @@ class ScenarioUI:
         home_box = column(
             section("Home productivity"),
             row(w["A_c0"], w["A_d0"]),
-            row(w["A_c_elast"], w["A_d_elast"]),
+            # row(w["A_c_elast"], w["A_d_elast"]),
         )
 
         num_box = column(
