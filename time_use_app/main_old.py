@@ -27,7 +27,7 @@ Notes:
 - Participation/value functions are implemented as in make_figures.py:
     V = (E/B)^eps / eps  -  L^{1+1/phi}/(1+1/phi)
   Participation probability is a smoothed logit:
-    P(h)=exp((Vp-ū)/σu)/[exp((Vp-ū)/σu)+exp(Vnp/σu)]  (logit with fixed cost ū)
+    P(h)=1/(1+exp(-(Vm-Vn)/sigma_part))
 """
 
 # from __future__ import annotations
@@ -76,9 +76,9 @@ DEFAULTS: Dict[str, object] = {
     "A_d0": 1.0,
     "A_c_elast": 0.0,
     "A_d_elast": 0.0,
-    # participation choice (addendum)
-    "u_bar": 0.0,
-    "sigma_u": 5.0,
+
+    # participation smoothing
+    "sigma_part": 5.0,
 
     # solver controls (outer fixed point)
     "fp_tol": 1e-10,
@@ -140,10 +140,6 @@ def _safe_logistic(z: float) -> float:
     ez = math.exp(z)
     return ez / (1.0 + ez)
 
-def _logsumexp(a: float, b: float) -> float:
-    m = max(a, b)
-    return m + math.log(math.exp(a - m) + math.exp(b - m))
-
 
 # ----------------------------
 # Value + participation
@@ -161,15 +157,9 @@ def value_from_household(hh: Household) -> float:
     return float(V_goods - V_time)
 
 
-def participation_prob(Vp: float, Vnp: float, u_bar: float, sigma_u: float) -> float:
-    """Logit participation probability (addendum):
-    choose work if Vp - u_bar + eps_work >= Vnp + eps_nonwork,
-    with i.i.d. type-I extreme value shocks scaled by sigma_u.
-    """
-    su = max(1e-12, float(sigma_u))
-    v1 = (Vp - float(u_bar)) / su
-    v0 = Vnp / su
-    return float(math.exp(v1 - _logsumexp(v1, v0)))
+def participation_prob(Vm: float, Vn: float, sigma_part: float) -> float:
+    z = (Vm - Vn) / max(1e-12, float(sigma_part))
+    return float(_safe_logistic(z))
 
 
 # ----------------------------
@@ -228,8 +218,7 @@ class SimConfig:
     A_d0: float
     A_c_elast: float
     A_d_elast: float
-    u_bar: float
-    sigma_u: float
+    sigma_part: float
     fp_tol: float
     fp_max_iter: int
     fp_damping: float
@@ -315,7 +304,7 @@ def run_simulation(mp: ModelParams, cfg: SimConfig) -> Dict[str, np.ndarray]:
         Vn[i] = value_from_household(hh_np)
         Lc_guess_np, Ld_guess_np = float(hh_np.Lc), float(hh_np.Ld)
 
-        P[i] = participation_prob(Vm[i], Vn[i], float(cfg.u_bar), float(cfg.sigma_u))
+        P[i] = participation_prob(Vm[i], Vn[i], float(cfg.sigma_part))
 
         E[i] = float(hh.E)
         thx[i], thc[i], thd[i] = float(hh.th_x), float(hh.th_c), float(hh.th_d)
@@ -357,7 +346,7 @@ def run_simulation(mp: ModelParams, cfg: SimConfig) -> Dict[str, np.ndarray]:
         Vn_pol = value_from_household(hh_np)
         Lc_guess_np, Ld_guess_np = float(hh_np.Lc), float(hh_np.Ld)
 
-        P_policy[i] = participation_prob(Vm_pol, Vn_pol, float(cfg.u_bar), float(cfg.sigma_u))
+        P_policy[i] = participation_prob(Vm_pol, Vn_pol, float(cfg.sigma_part))
 
     dP = P_policy - P
 
@@ -426,8 +415,7 @@ class ScenarioUI:
         add_float("A_d_elast", "A_d_elast - irrelevant")
 
         # participation smoothing
-        add_float("u_bar", "u_bar (fixed utility cost of working)")
-        add_float("sigma_u", "sigma_u (taste-shock scale)")
+        add_float("sigma_part", "sigma_part (logit scale) - prob irrelevant")
 
         # solver controls
         add_float("fp_tol", "fp_tol")
@@ -460,15 +448,14 @@ class ScenarioUI:
         self.status_div = Div(text="", width=440)
 
         self.reset_btn.on_click(self.reset_all)
-        self.solve_btn.on_click(self.solve_clicked)
+        self.solve_btn.on_click(self.solve_and_update)
 
         # --- plots ---
         self.sources = self._make_sources()
         self.plots = self._make_plots()
 
         # initial solve so plots aren’t empty
-        # self.solve_and_update()
-        self.solve_clicked()
+        self.solve_and_update()
 
         # --- layout ---
         controls = self._make_controls_layout()
@@ -617,7 +604,7 @@ class ScenarioUI:
 
         num_box = column(
             section("Solver & participation"),
-            row(w["u_bar"], w["sigma_u"]),
+            row(w["sigma_part"]),
             row(w["fp_tol"], w["fp_max_iter"]),
             row(w["fp_damping"]),
             row(w["np_tol"], w["np_max_iter"]),
@@ -697,8 +684,7 @@ class ScenarioUI:
             A_d0=_parse_float(self.widgets["A_d0"].value, float(self.defaults["A_d0"])),
             A_c_elast=_parse_float(self.widgets["A_c_elast"].value, float(self.defaults["A_c_elast"])),
             A_d_elast=_parse_float(self.widgets["A_d_elast"].value, float(self.defaults["A_d_elast"])),
-            u_bar=_parse_float(self.widgets["u_bar"].value, float(self.defaults["u_bar"])),
-            sigma_u=_parse_float(self.widgets["sigma_u"].value, float(self.defaults["sigma_u"])),
+            sigma_part=_parse_float(self.widgets["sigma_part"].value, float(self.defaults["sigma_part"])),
             fp_tol=_parse_float(self.widgets["fp_tol"].value, float(self.defaults["fp_tol"])),
             fp_max_iter=_parse_int(self.widgets["fp_max_iter"].value, int(self.defaults["fp_max_iter"])),
             fp_damping=_parse_float(self.widgets["fp_damping"].value, float(self.defaults["fp_damping"])),
@@ -707,18 +693,10 @@ class ScenarioUI:
             np_damping=_parse_float(self.widgets["np_damping"].value, float(self.defaults["np_damping"])),
         )
         return mp, cfg
-    
-    def solve_clicked(self) -> None:
-        # Set UI state *now* so it gets pushed to the browser
-        self.solve_btn.disabled = True
-        self.status_div.text = "<i>Solving…</i>"
-    
-        # Run the heavy solve on the next tick (after UI update flushes)
-        curdoc().add_next_tick_callback(self.solve_and_update)
 
     def solve_and_update(self) -> None:
-        # self.solve_btn.disabled = True
-        # self.status_div.text = "<i>Solving…</i>"
+        self.solve_btn.disabled = True
+        self.status_div.text = "<i>Solving…</i>"
 
         # update axis labels
         xlab = "log(h)" if self.widgets["x_axis"].value == "log" else "h"
