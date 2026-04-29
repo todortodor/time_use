@@ -441,11 +441,11 @@ class ScenarioUI:
 
         # Counterfactual results
         self.cf_table_source = ColumnDataSource(
-            dict(scenario=[], dGDP=[], dPf=[], dratio=[]))
+            dict(scenario=[], dGDP=[], dPf=[], dratio=[], dN_pct_max=[]))
         self.cf_map_sources = {
             (cf, ind): ColumnDataSource(self._initial_map_data())
             for cf in ("wage", "pc", "pd")
-            for ind in ("dGDP", "dPf", "dratio")
+            for ind in ("dGDP", "dPf", "dratio", "dN_pct")
         }
 
         # Build plots and tabs
@@ -625,17 +625,21 @@ class ScenarioUI:
                             formatter=NumberFormatter(format="+0.000")),
                 TableColumn(field="dratio", title="Δratio (pp)",
                             formatter=NumberFormatter(format="+0.000")),
+                TableColumn(field="dN_pct_max", title="max |ΔN| (%)",
+                            formatter=NumberFormatter(format="0.00")),
             ],
-            width=720, height=140, index_position=None,
+            width=820, height=140, index_position=None,
         )
         cf_buttons = row(self.cf_btn_wage, self.cf_btn_pc, self.cf_btn_pd)
         cf_maps = self._make_cf_maps_grid()
         cf_panel = column(
             Div(text="<b>Counterfactual results.</b> Run any of the three "
                      "scenarios. The table shows national means; the maps show "
-                     "per-county changes. Requires the spatial baseline to be "
-                     "solved first (Spatial tab).",
-                width=720),
+                     "per-county changes. The fourth column of maps shows "
+                     "predicted migration response (ΔN%) under a logit "
+                     "reallocation with σ_mig = 1.0. Requires the spatial "
+                     "baseline to be solved first (Spatial tab).",
+                width=820),
             cf_buttons, cf_table, cf_maps,
         )
 
@@ -651,7 +655,8 @@ class ScenarioUI:
                      ("pd", "p_d × 0.7")]
         indicators = [("dGDP", "ΔGDP (%)", "RdBu11"),
                       ("dPf", "ΔP_f (pp)", "PiYG11"),
-                      ("dratio", "Δratio (pp)", "PuOr11")]
+                      ("dratio", "Δratio (pp)", "PuOr11"),
+                      ("dN_pct", "ΔN (% migration)", "RdBu11")]
         rows_ = []
         for scen_key, scen_lab in scenarios:
             map_row = []
@@ -841,6 +846,18 @@ class ScenarioUI:
         rows_table = []
         scen_labels = {"wage": "Wage gap = 1",
                        "pc": "p_c × 0.7", "pd": "p_d × 0.7"}
+
+        # Precompute baseline amenities xi_l (same for all CFs)
+        # using the population-weighted mean utility convention.
+        Ns_base    = np.array([base[c]["N_county"] for c in ids])
+        Vstar_base = np.array([float(np.nanmean(base[c]["V"])) for c in ids])
+        Ubar_base  = float(np.average(Vstar_base, weights=Ns_base))
+        xi_arr     = Ubar_base - Vstar_base
+
+        # Migration response: logit reallocation.
+        # sigma_mig is uncalibrated; 1.0 is the same value as in spatial.py.
+        sigma_mig = 1.0
+
         for kind, lab in scen_labels.items():
             if kind not in self.cf_results:
                 continue
@@ -858,25 +875,38 @@ class ScenarioUI:
                 cLm = np.nanmean(cf[c]["LM_m"]);   cLf = np.nanmean(cf[c]["LM_f"])
                 br = bLf / max(bLm, 1e-9); cr = cLf / max(cLm, 1e-9)
                 dratio.append(100.0 * (cr - br))
+
+            # Migration: logit reallocation given new V*_l + xi_l.
+            # N'_l proportional to N_l * exp((V*'_l + xi_l - Ubar') / sigma_mig).
+            # The N_l factor is essential: at baseline (V*'_l = V*_l), all w_l=1
+            # so N'_l = N_l (no migration). Without it, the baseline would predict
+            # uniform population.
+            Vstar_new = np.array([float(np.nanmean(cf[c]["V"])) for c in ids])
+            Ubar_new  = float(np.average(Vstar_new + xi_arr, weights=Ns_base))
+            log_w = (Vstar_new + xi_arr - Ubar_new) / max(sigma_mig, 1e-9)
+            log_w -= log_w.max()           # numerical stability
+            w = Ns_base * np.exp(log_w)
+            N_new = float(np.sum(Ns_base)) * w / float(np.sum(w))
+            dN_pct = list(100.0 * (N_new / Ns_base - 1.0))
+
             # Update map sources
             for ind_key, vals in [("dGDP", dGDP), ("dPf", dPf),
-                                  ("dratio", dratio)]:
+                                  ("dratio", dratio), ("dN_pct", dN_pct)]:
                 src = self.cf_map_sources[(kind, ind_key)]
                 src.data = dict(
                     id=ids,
                     name=[COUNTY[c]["name"] for c in ids],
                     lat=[COUNTY[c]["lat"] for c in ids],
                     lon=[COUNTY[c]["lon"] for c in ids],
-                    value=vals,
+                    value=list(vals),
                 )
-                # Update color scale to symmetric around 0
-                m = max(abs(min(vals)), abs(max(vals))) or 1.0
-                # Find the color mapper for this map (first scatter renderer)
+
             rows_table.append(dict(
                 scenario=lab,
                 dGDP=float(np.mean(dGDP)),
                 dPf=float(np.mean(dPf)),
                 dratio=float(np.mean(dratio)),
+                dN_pct_max=float(np.max(np.abs(dN_pct))),
             ))
         # Update table source
         if rows_table:
@@ -885,6 +915,7 @@ class ScenarioUI:
                 dGDP=[r["dGDP"] for r in rows_table],
                 dPf=[r["dPf"] for r in rows_table],
                 dratio=[r["dratio"] for r in rows_table],
+                dN_pct_max=[r["dN_pct_max"] for r in rows_table],
             )
 
     # ── Top-level layout ──

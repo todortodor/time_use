@@ -515,7 +515,11 @@ def counterfactual(
         sigma_mig = 1.0
         log_weights = (V_star_new + xi_arr - U_bar_new) / sigma_mig
         log_weights -= log_weights.max()
-        weights  = np.exp(log_weights)
+        # N'_l proportional to N_l * exp((V*'_l + xi_l - Ubar') / sigma_mig).
+        # The N_l prior factor is essential: at baseline (V*'_l = V*_l), all
+        # exp() terms = 1 so N'_l = N_l (no migration). Without the N_l
+        # factor, baseline would predict uniform population.
+        weights  = Ns * np.exp(log_weights)
         N_bar    = float(np.sum(Ns))
         N_new    = N_bar * weights / float(np.sum(weights))
         delta_N  = N_new - Ns
