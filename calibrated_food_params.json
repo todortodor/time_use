@@ -1,0 +1,16 @@
+{
+  "eps_engel": 0.291,
+  "beta_xf": 0.5685,
+  "beta_xn": 0.4315,
+  "kappa_xf": 0.2831,
+  "kappa_xn": -0.2831,
+  "Lxf_m_cond": 11.337,
+  "Lxf_f_cond": 20.637,
+  "r_xf": 0.5494,
+  "D_xf_m": 1.0,
+  "D_xf_f": 3.3135,
+  "omega_xf": 0.75,
+  "eta_xf": 2.5,
+  "A_xf": 1.0,
+  "_notes": "Calibrated extension for food/non-food split. The kappa signs are correct: kappa_food < 0 (necessity), kappa_nonfood > 0 (luxury). D_xf_f > 1 because women supply more food prep hours than men (consistent with Engel curves for food prep). Integration into the 8-equation solver is pending; the existing 3-good solver continues to operate."
+}
