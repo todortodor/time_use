@@ -231,10 +231,15 @@ def solve_county(global_params: dict, county_params: dict,
             E_arr[i] = float(hh.E)
             th_x[i] = float(hh.th_x); th_c[i] = float(hh.th_c); th_d[i] = float(hh.th_d)
             Sc_tot = float(hh.Sc); Sd_tot = float(hh.Sd)
-            ScH_share[i] = hh.ScH / Sc_tot if Sc_tot > 0 else np.nan
-            ScM_share[i] = hh.ScM / Sc_tot if Sc_tot > 0 else np.nan
-            SdH_share[i] = hh.SdH / Sd_tot if Sd_tot > 0 else np.nan
-            SdM_share[i] = hh.SdM / Sd_tot if Sd_tot > 0 else np.nan
+            # Expenditure shares: P_iH * S_iH / (P_i * S_i). These sum to 1
+            # by the CES envelope condition. Quantity ratios (S_iH/S_i) do
+            # NOT sum to 1 because S_i is the CES composite, not a sum.
+            if Sc_tot > 0 and hh.Pc > 0:
+                ScH_share[i] = (hh.PcH * hh.ScH) / (hh.Pc * Sc_tot)
+                ScM_share[i] = (hh.pc  * hh.ScM) / (hh.Pc * Sc_tot)
+            if Sd_tot > 0 and hh.Pd > 0:
+                SdH_share[i] = (hh.PdH * hh.SdH) / (hh.Pd * Sd_tot)
+                SdM_share[i] = (hh.pd  * hh.SdM) / (hh.Pd * Sd_tot)
             # Value (per Block E)
             V_arr[i] = (hh.E / hh.B) ** mp.eps_engel / mp.eps_engel - \
                        hh.L ** (1.0 + 1.0 / mp.phi) / (1.0 + 1.0 / mp.phi)
