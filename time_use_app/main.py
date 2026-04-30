@@ -737,23 +737,22 @@ class ScenarioUI:
         # Tab 1: per-h
         tab1 = TabPanel(child=column(
             row(self.p_hours, self.p_gap),
-            row(self.p_sh,    self.p_hm,  ),
-            row(self.p_part,             ),
-            
+            row(self.p_sh,    self.p_hm),
+            row(self.p_part),
         ), title="Per-h plots (selected county)")
 
         # Tab 2: spatial summary
         tab2 = TabPanel(child=column(
+            row(self.solve_all_btn),
             row(self.p_vs, self.p_ratio),
-            row(self.p_xi, self.p_emp,   ),
-            
+            row(self.p_xi, self.p_emp),
         ), title="Spatial summary")
 
         # Tab 3: counterfactuals
         cf_grid_rows = []
         for sc in ("wage", "pc", "pd"):
             row_figs = [self.cf_map_figs[(sc, ind, "fig")]
-                        for ind in ("dGDP","dPf","dratio","dN")]
+                        for ind in ("dGDP", "dPf", "dratio", "dN")]
             cf_grid_rows.append(row(*row_figs))
         tab3 = TabPanel(child=column(
             row(self.cf_btn_wage, self.cf_btn_pc, self.cf_btn_pd),
@@ -763,7 +762,8 @@ class ScenarioUI:
 
         self.tabs = Tabs(tabs=[tab1, tab2, tab3])
 
-        # Parameter blocks (two-per-row)
+        # Parameter blocks (two-per-row), each with an explicit width=380 so
+        # the controls column has a definite size and never collapses.
         def two_per_row(inputs_dict, fields):
             rows = []
             it = iter(fields)
@@ -773,31 +773,40 @@ class ScenarioUI:
                     rows.append(row(inputs_dict[k1], inputs_dict[k2]))
                 except StopIteration:
                     rows.append(row(inputs_dict[k1]))
-            return column(*rows)
+            return column(*rows, width=380)
 
         global_block = column(
-            Div(text="<b>Global parameters</b>"),
-            two_per_row(self.global_inputs, GLOBAL_FIELDS))
+            Div(text="<details open><summary><b>Global parameters</b> "
+                     "(click to collapse)</summary>", width=380),
+            two_per_row(self.global_inputs, GLOBAL_FIELDS),
+            Div(text="</details>", width=380),
+            width=380,
+        )
         county_block = column(
-            Div(text="<b>County parameters</b>"),
-            two_per_row(self.county_inputs, COUNTY_FIELDS))
-
-        controls = column(
-            row(self.solve_btn, self.reset_btn),
-            row(self.solve_all_btn, self.map_metric),
             self.county_label,
+            Div(text="<details open><summary><b>County-specific parameters"
+                     "</b></summary>", width=380),
+            two_per_row(self.county_inputs, COUNTY_FIELDS),
+            Div(text="</details>", width=380),
+            width=380,
+        )
+
+        # Controls column: header, map metric, map, buttons, status,
+        # then the parameter blocks.  Explicit width=420 (380 plus padding).
+        controls = column(
+            Div(text=f"<h2 style='margin:0'>{self.label}</h2>", width=400),
+            self.map_metric,
+            self.p_map,
+            row(self.solve_btn, self.reset_btn),
+            self.status,
             global_block,
             county_block,
+            width=420,
         )
 
-        self.layout = column(
-            Div(text=f"<h2 style='margin:0'>{self.label}</h2>"),
-            self.p_map,
-            controls,
-            self.status,
-            self.tabs,
-            
-        )
+        # Top-level layout: side-by-side row of controls and tabs (matches
+        # the layout shape of the existing 3-good app).
+        self.layout = row(controls, self.tabs)
 
     # ------------------------------------------------------------------ #
     # Callbacks                                                          #
@@ -1134,16 +1143,12 @@ class ScenarioUI:
 ui_A = ScenarioUI("Scenario A")
 ui_B = ScenarioUI("Scenario B")
 
-doc_title = Div(
-    text=("<h1 style='margin:4px 0'>Kenya Time-Use Model — 4-good "
-           "spatial equilibrium</h1>"
-           "<p style='margin:0'>Edit parameters, click Solve, "
-           "compare scenarios.</p>"))
+page = row(
+    ui_A.layout,
+    Spacer(width=24),
+    ui_B.layout,
+    sizing_mode="stretch_width",
+)
 
-curdoc().add_root(column(
-    doc_title,
-    row(ui_A.layout, Spacer(width=20), ui_B.layout,
-        ),
-    
-))
+curdoc().add_root(page)
 curdoc().title = "Kenya Time-Use Model"
