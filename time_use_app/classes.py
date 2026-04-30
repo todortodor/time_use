@@ -1,372 +1,228 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-classes.py  –  model parameters and household object for the extended model.
+classes.py — dataclasses for the 4-good Kenya time-use model.
 
-Extensions vs. baseline:
-  • Gender-differentiated disutility weights (D_M, D_c, D_d separately for m/f).
-  • Two effective wages y_m, y_f (= w_ell * h_m / h_f).
-  • Household labor aggregate  L = L^m + L^f  where each L^g is a gender-
-    specific CES aggregate of (L_M^g, L_c^g, L_d^g).
-  • Six labor choice variables instead of three.
-  • The solver works in the 6-dimensional labor space
-    (LM_m, LM_f, Lc_m, Lc_f, Ld_m, Ld_f).
-  • Home production uses total hours: S_H^i = A_i (L_i^m + L_i^f).
-  • lambda fixed-point and PIGL demands are unchanged in structure.
+Three classes:
+
+  ModelParams   global structural parameters (frozen)
+  Household     state container for one household at one (county, h) point
+  County        county-level fundamentals (mutable; the spatial layer fills xi
+                and V_star after the baseline solve)
+
+Goods
+  xf  food          (home-producible, market substitute)
+  xn  non-food      (market only, numeraire: P_xn = 1)
+  c   care services (home-producible, market substitute)
+  d   domestic      (home-producible, market substitute)
+
+Activities
+  M   market work
+  xf  home food preparation
+  c   home care
+  d   home domestic
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Tuple
+
 import numpy as np
 
-from functions import (
-    clamp, safe_pow, EPS,
-    ces_unit_cost, pigl_B, pigl_lambda, pigl_shares,
-    ces_labor_aggregate, bisect_root,
-)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Parameters
-# ═══════════════════════════════════════════════════════════════════════════════
+# --------------------------------------------------------------------------- #
+# ModelParams                                                                 #
+# --------------------------------------------------------------------------- #
 
 @dataclass(frozen=True)
 class ModelParams:
-    """
-    Global (structural) parameters of the extended model.
+    """Global, structural parameters shared across counties."""
 
-    Gender-specific disutility weights are stored as separate fields
-    for men (suffix _m) and women (suffix _f).
-    """
-    # ── PIGL ──────────────────────────────────────────────────────────────────
+    # PIGL preferences (4 goods)
     eps_engel: float
-    beta_x:    float
+    beta_xf:   float
+    beta_xn:   float
     beta_c:    float
     beta_d:    float
-    kappa_x:   float
+    kappa_xf:  float
+    kappa_xn:  float
     kappa_c:   float
     kappa_d:   float
 
-    # ── Home-market CES ───────────────────────────────────────────────────────
-    omega_c: float
-    omega_d: float
-    eta_c:   float
-    eta_d:   float
+    # Home/market CES (3 home-producible goods)
+    omega_xf: float
+    omega_c:  float
+    omega_d:  float
+    eta_xf:   float
+    eta_c:    float
+    eta_d:    float
 
-    # ── Disutility weights – men ───────────────────────────────────────────────
-    D_M_m: float
-    D_c_m: float
-    D_d_m: float
+    # Disutility weights (8 = 4 activities × 2 genders).
+    # Men's market and home-care are normalised to 1 by convention
+    # (D_M_m = D_xf_m = D_c_m = 1).
+    D_M_m:  float
+    D_xf_m: float
+    D_c_m:  float
+    D_d_m:  float
+    D_M_f:  float
+    D_xf_f: float
+    D_c_f:  float
+    D_d_f:  float
 
-    # ── Disutility weights – women ─────────────────────────────────────────────
-    D_M_f: float
-    D_c_f: float
-    D_d_f: float
+    # Labour aggregator
+    rho: float   # < 0  =>  complementarity across activities
+    phi: float   # Frisch elasticity
 
-    # ── Labor aggregate ────────────────────────────────────────────────────────
-    rho: float    # < 0  →  complementarity across activities
-    phi: float    # Frisch elasticity
+    # Participation logit
+    sigma_u_m: float
+    sigma_u_f: float
+    u_bar_m:   float
+    u_bar_f:   float
+
+    # National
+    wage_gap: float   # y_f / y_m at h_m = h_f, level (≈ 0.83)
+    p_xf:     float   # uniform national food price (1000-KSh/unit)
+    sigma_mig: float = 1.0   # migration scale, hardcoded literature value
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Household
-# ═══════════════════════════════════════════════════════════════════════════════
+# --------------------------------------------------------------------------- #
+# Household                                                                   #
+# --------------------------------------------------------------------------- #
 
 @dataclass
 class Household:
     """
-    Household with one man and one woman.
+    One household at one (county, h) point.  The solver writes back into this
+    object so the Bokeh app can read every intermediate quantity.
 
-    The solver iterates over the 6-vector
-      (LM_m, LM_f, Lc_m, Lc_f, Ld_m, Ld_f)
-    and calls evaluate_from_labor() at each step.
-
-    Everything else (lambda, prices, demands, residuals) is computed
-    internally and stored as attributes so the Bokeh app can read them.
+    `state = (s_m, s_f)` selects which of the four participation states is
+    being solved.  Inactive market-work components are pinned to zero by the
+    solver wrappers; this dataclass carries them all.
     """
+
+    # ---- inputs ----------------------------------------------------------- #
     params: ModelParams
+    y_m:  float    # effective male wage   = w_l · h_m
+    y_f:  float    # effective female wage = wage_gap · w_l · h_f
+    p_xf: float    # price of food (national, but stored locally for the solver)
+    pc:   float
+    pd:   float
+    a:    float    # non-labour income (1000-KSh/period)
 
-    # ── Exogenous (county-level) ───────────────────────────────────────────────
-    y_m: float      # effective wage of man   = w_ell * h_m
-    y_f: float      # effective wage of woman = w_ell * h_f
-    pc:  float      # market price of care services
-    pd:  float      # market price of domestic services
-    a:   float      # non-labor income
+    # Home productivities (county-level; literature priors leave them at 1)
+    A_xf: float = 1.0
+    A_c:  float = 1.0
+    A_d:  float = 1.0
 
-    # ── Home productivity (county-level, gender-neutral) ──────────────────────
-    A_c: float = 1.0
-    A_d: float = 1.0
+    # Participation state being solved
+    state: Tuple[int, int] = (1, 1)
 
-    # ── Labor choices (filled by evaluate_from_labor) ─────────────────────────
-    LM_m: float = np.nan
-    LM_f: float = np.nan
-    Lc_m: float = np.nan
-    Lc_f: float = np.nan
-    Ld_m: float = np.nan
-    Ld_f: float = np.nan
+    # ---- labour (filled by solver) --------------------------------------- #
+    LM_m:  float = np.nan
+    LM_f:  float = np.nan
+    Lxf_m: float = np.nan
+    Lxf_f: float = np.nan
+    Lc_m:  float = np.nan
+    Lc_f:  float = np.nan
+    Ld_m:  float = np.nan
+    Ld_f:  float = np.nan
 
-    # ── Aggregate labor ───────────────────────────────────────────────────────
-    L_m: float = np.nan    # gender-specific CES aggregate
+    # Aggregates
+    L_m: float = np.nan
     L_f: float = np.nan
-    L:   float = np.nan    # household total  L = L_m + L_f
+    L:   float = np.nan
 
-    # ── Prices and lambda ────────────────────────────────────────────────────
+    # ---- prices, lambda, demands ----------------------------------------- #
     E:    float = np.nan
     lam:  float = np.nan
+    PxfH: float = np.nan
     PcH:  float = np.nan
     PdH:  float = np.nan
+    Pxf:  float = np.nan
     Pc:   float = np.nan
     Pd:   float = np.nan
     B:    float = np.nan
 
-    # ── PIGL demands ─────────────────────────────────────────────────────────
-    th_x: float = np.nan
-    th_c: float = np.nan
-    th_d: float = np.nan
-    x:    float = np.nan
-    Sc:   float = np.nan
-    Sd:   float = np.nan
+    th_xf: float = np.nan
+    th_xn: float = np.nan
+    th_c:  float = np.nan
+    th_d:  float = np.nan
 
-    # ── Input splits ─────────────────────────────────────────────────────────
-    ScH: float = np.nan
-    SdH: float = np.nan
-    ScM: float = np.nan
-    SdM: float = np.nan
+    xn:  float = np.nan
+    Sxf: float = np.nan
+    Sc:  float = np.nan
+    Sd:  float = np.nan
 
-    # ── Residuals (6-vector) ─────────────────────────────────────────────────
-    residuals: np.ndarray = field(default_factory=lambda: np.full(6, np.nan))
+    SxfH: float = np.nan
+    ScH:  float = np.nan
+    SdH:  float = np.nan
+    SxfM: float = np.nan
+    ScM:  float = np.nan
+    SdM:  float = np.nan
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 0 – set labor
-    # ─────────────────────────────────────────────────────────────────────────
+    # Value at this single state (eq. 23)
+    V_state: float = np.nan
 
-    def set_labor(self, LM_m: float, LM_f: float,
-                  Lc_m: float, Lc_f: float,
-                  Ld_m: float, Ld_f: float) -> None:
-        (self.LM_m, self.LM_f,
-         self.Lc_m, self.Lc_f,
-         self.Ld_m, self.Ld_f) = (float(LM_m), float(LM_f),
-                                   float(Lc_m), float(Lc_f),
-                                   float(Ld_m), float(Ld_f))
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 1 – total expenditure  E = y_m L_M^m + y_f L_M^f + a   (D1)
-    # ─────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------- #
+# County                                                                      #
+# --------------------------------------------------------------------------- #
 
-    def compute_E(self) -> None:
-        self.E = float(self.y_m * self.LM_m + self.y_f * self.LM_f + self.a)
+@dataclass
+class County:
+    """
+    All county-l fundamentals needed for the spatial equilibrium.
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 2 – gender-specific and household labor aggregates   (D3 extended)
-    #
-    # L^g = CES(D_M^g L_M^g,  D_c^g L_c^g,  D_d^g L_d^g)
-    # L   = L^m + L^f
-    # ─────────────────────────────────────────────────────────────────────────
+    Productivities follow free-entry pricing (eq. 28-30):
+        AM_xn = w_l                   (numeraire)
+        AM_xf = w_l / p_xf            (uniform national p_xf)
+        AM_c  = w_l / pc_l
+        AM_d  = w_l / pd_l
 
-    def compute_L_aggregate(self) -> None:
-        p = self.params
-        self.L_m = ces_labor_aggregate(
-            self.LM_m, self.Lc_m, self.Ld_m,
-            p.D_M_m, p.D_c_m, p.D_d_m, p.rho,
-        )
-        self.L_f = ces_labor_aggregate(
-            self.LM_f, self.Lc_f, self.Ld_f,
-            p.D_M_f, p.D_c_f, p.D_d_f, p.rho,
-        )
-        self.L = float(self.L_m + self.L_f)
+    These are stored explicitly so the UI can show / edit them.
+    """
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 3 – shadow price of home-produced service i for gender g   (D4)
-    #
-    # P_i^{H,g} = L^{1/φ+1/ρ} · D_i^g · (L_i^g)^{-1/ρ}  /  (A_i λ)
-    #
-    # At the optimum the two genders have equal shadow prices, so we can
-    # use either.  We use the sum-of-hours form directly:
-    # the household shadow price is computed via the aggregate first-order
-    # condition (which does not depend on the gender split).
-    # ─────────────────────────────────────────────────────────────────────────
+    name:      str
+    county_id: int
+    lat:       float = np.nan
+    lon:       float = np.nan
 
-    def _shadow_price_home(self, Li_g: float, Di_g: float,
-                           Ai: float, lam: float) -> float:
-        """
-        Shadow price for gender g in service i.
-        P_i^{H,g} = L^{1/φ+1/ρ} · D_i^g (L_i^g)^{-1/ρ} / (A_i λ)
-        """
-        p      = self.params
-        L_term = safe_pow(clamp(self.L), 1.0 / p.phi + 1.0 / p.rho)
-        zi     = clamp(Di_g * Li_g)
-        return float(L_term * safe_pow(zi, -1.0 / p.rho) / (clamp(Ai) * clamp(lam)))
+    # Wage and prices (all in 1000-KSh units)
+    w_ell: float = 0.05
+    p_xf:  float = 0.05    # uniform national, copied from ModelParams
+    pc:    float = 0.05
+    pd:    float = 0.05
 
-    def _prices_given_lambda(self, lam: float) -> tuple[float, float, float, float, float]:
-        """
-        Given λ, compute PcH, PdH, Pc, Pd, B.
-        We use the *man's* shadow price; at the optimum both genders agree.
-        """
-        p    = self.params
-        PcH  = self._shadow_price_home(self.Lc_m, p.D_c_m, self.A_c, lam)
-        PdH  = self._shadow_price_home(self.Ld_m, p.D_d_m, self.A_d, lam)
-        Pc   = ces_unit_cost(PcH, self.pc, p.omega_c, p.eta_c)
-        Pd   = ces_unit_cost(PdH, self.pd, p.omega_d, p.eta_d)
-        B    = pigl_B(Pc, Pd, p.beta_c, p.beta_d)
-        return PcH, PdH, Pc, Pd, B
+    # Market-sector productivities (free-entry identities)
+    AM_xn: float = 0.05
+    AM_xf: float = 1.0
+    AM_c:  float = 1.0
+    AM_d:  float = 1.0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 4 – solve for λ from fixed-point  λ = (1/B)(E/B)^{ε-1}   (C1)
-    # ─────────────────────────────────────────────────────────────────────────
+    # Home productivities (= 1 in baseline; literature)
+    A_xf_home: float = 1.0
+    A_c_home:  float = 1.0
+    A_d_home:  float = 1.0
 
-    def solve_lambda(self) -> None:
-        self.compute_E()
-        self.compute_L_aggregate()
+    # Population (TUS person-day weights summed; not census)
+    N: float = 1.0
 
-        eps = self.params.eps_engel
+    # County-specific D weights (men's market, food-prep, care normalised to 1)
+    D_M_m:  float = 1.0
+    D_xf_m: float = 1.0
+    D_c_m:  float = 1.0
+    D_d_m:  float = 1.0
+    D_M_f:  float = 1.0
+    D_xf_f: float = 1.0
+    D_c_f:  float = 1.0
+    D_d_f:  float = 1.0
 
-        def f(lam: float) -> float:
-            _, _, _, _, B = self._prices_given_lambda(lam)
-            return lam - pigl_lambda(self.E, B, eps)
+    # Calibrated equilibrium objects (filled by spatial solve)
+    V_star: float = np.nan   # E[V] from four-state participation
+    P_m:    float = np.nan
+    P_f:    float = np.nan
+    xi:     float = np.nan   # amenity, calibrated as Ubar - V_star
 
-        lo, hi = 1e-12, 1e6
-        flo, fhi = f(lo), f(hi)
-        it = 0
-        while flo * fhi > 0 and it < 60:
-            hi  *= 10.0
-            fhi  = f(hi)
-            it  += 1
-        if flo * fhi > 0:
-            raise RuntimeError("Could not bracket λ root; check parameters/inputs.")
-
-        self.lam = float(bisect_root(f, lo, hi))
-        self.PcH, self.PdH, self.Pc, self.Pd, self.B = \
-            self._prices_given_lambda(self.lam)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 5 – PIGL demands   (D7, P1-P3)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def compute_pigl_demands(self) -> None:
-        p = self.params
-        self.th_x, self.th_c, self.th_d = pigl_shares(
-            self.E, self.B, p.eps_engel,
-            p.beta_x, p.beta_c, p.beta_d,
-            p.kappa_x, p.kappa_c, p.kappa_d,
-        )
-        self.x  = float(self.th_x * self.E)
-        self.Sc = float(self.th_c * self.E / clamp(self.Pc))
-        self.Sd = float(self.th_d * self.E / clamp(self.Pd))
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 6 – conditional input demands   (37, 38)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def compute_input_splits(self) -> None:
-        p = self.params
-        self.ScM = float((1.0 - p.omega_c)
-                         * safe_pow(self.Pc / clamp(self.pc), p.eta_c) * self.Sc)
-        self.SdM = float((1.0 - p.omega_d)
-                         * safe_pow(self.Pd / clamp(self.pd), p.eta_d) * self.Sd)
-        self.ScH = float(p.omega_c
-                         * safe_pow(self.Pc / clamp(self.PcH), p.eta_c) * self.Sc)
-        self.SdH = float(p.omega_d
-                         * safe_pow(self.Pd / clamp(self.PdH), p.eta_d) * self.Sd)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Step 7 – 6-equation residual system
-    #
-    # (1) Market work FOC – man
-    #     λ y_m = L^{1/φ+1/ρ} D_M^m (L_M^m)^{-1/ρ}
-    #
-    # (2) Market work FOC – woman
-    #     λ y_f = L^{1/φ+1/ρ} D_M^f (L_M^f)^{-1/ρ}
-    #
-    # (3) Home care identity – man (from conditional demand + home prod.)
-    #     A_c L_c^m = ScH · [D_c^m (L_c^m)^{-1/ρ}]
-    #                      / [D_c^m (L_c^m)^{-1/ρ} + D_c^f (L_c^f)^{-1/ρ}]
-    #     i.e. man's share of ScH proportional to his marginal disutility weight
-    #
-    # (4) Home care identity – woman (symmetric)
-    #
-    # (5) Home domestic identity – man
-    #
-    # (6) Home domestic identity – woman
-    #
-    # Equations (3)-(6) combine:
-    #   S_iH = A_i (L_i^m + L_i^f)                    (home production)
-    #   S_iH^g / S_iH = D_i^g (L_i^g)^{-1/ρ}           (intrahousehold split L2/L3)
-    #                   / Σ_{g'} D_i^{g'} (L_i^{g'})^{-1/ρ}
-    #
-    # The fixed-point update naturally uses:
-    #   Total:  L_i^m + L_i^f  = ScH / A_i
-    #   Split:  L_i^m / L_i^f  = (D_i^m / D_i^f)^ρ    (from L2/L3 rearranged)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def compute_labor_residuals(self) -> None:
-        p   = self.params
-        rho = p.rho
-        phi = p.phi
-
-        L_term = safe_pow(clamp(self.L), 1.0 / phi + 1.0 / rho)
-
-        # FOC market work (man, woman)
-        eq1 = (self.lam * self.y_m
-               - L_term * safe_pow(clamp(p.D_M_m * self.LM_m), -1.0 / rho))
-        eq2 = (self.lam * self.y_f
-               - L_term * safe_pow(clamp(p.D_M_f * self.LM_f), -1.0 / rho))
-
-        # Home input identities: total hours consistent with ScH / A_i
-        total_Lc = self.ScH / clamp(self.A_c)
-        total_Ld = self.SdH / clamp(self.A_d)
-
-        # Gender split from L2 / L3:  L_i^m / L_i^f = (D_i^m / D_i^f)^ρ
-        # => L_i^m = total * ratio / (1 + ratio),  L_i^f = total / (1 + ratio)
-        ratio_c = safe_pow(clamp(p.D_c_m / p.D_c_f), rho)
-        ratio_d = safe_pow(clamp(p.D_d_m / p.D_d_f), rho)
-
-        Lc_m_star = total_Lc * ratio_c / (1.0 + ratio_c)
-        Lc_f_star = total_Lc / (1.0 + ratio_c)
-        Ld_m_star = total_Ld * ratio_d / (1.0 + ratio_d)
-        Ld_f_star = total_Ld / (1.0 + ratio_d)
-
-        eq3 = self.Lc_m - Lc_m_star
-        eq4 = self.Lc_f - Lc_f_star
-        eq5 = self.Ld_m - Ld_m_star
-        eq6 = self.Ld_f - Ld_f_star
-
-        self.residuals = np.array([eq1, eq2, eq3, eq4, eq5, eq6], dtype=float)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Main entry point
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def evaluate_from_labor(self,
-                            LM_m: float, LM_f: float,
-                            Lc_m: float, Lc_f: float,
-                            Ld_m: float, Ld_f: float,
-                            ) -> np.ndarray:
-        """
-        One call to evaluate everything and return the 6-residual vector.
-        Also stores all intermediate objects as attributes.
-        """
-        self.set_labor(LM_m, LM_f, Lc_m, Lc_f, Ld_m, Ld_f)
-        self.solve_lambda()
-        self.compute_pigl_demands()
-        self.compute_input_splits()
-        self.compute_labor_residuals()
-        return self.residuals
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Convenience aggregates for reporting / plotting
-    # ─────────────────────────────────────────────────────────────────────────
-
-    @property
-    def LM(self) -> float:
-        """Total market hours (man + woman)."""
-        return float(self.LM_m + self.LM_f)
-
-    @property
-    def Lc(self) -> float:
-        """Total home care hours."""
-        return float(self.Lc_m + self.Lc_f)
-
-    @property
-    def Ld(self) -> float:
-        """Total home domestic hours."""
-        return float(self.Ld_m + self.Ld_f)
+    # Market-clearing diagnostics (filled by spatial layer)
+    LM_xf_total: float = np.nan
+    LM_c_total:  float = np.nan
+    LM_d_total:  float = np.nan
+    LM_xn_total: float = np.nan

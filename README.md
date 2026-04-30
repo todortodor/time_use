@@ -1,173 +1,211 @@
-# Kenya Time-Use Model
+# Kenya Time-Use Model — 4-good full implementation
 
-Spatial equilibrium model of household time allocation across 47 Kenyan counties.
+This is the full-document implementation of the Kenya time-use spatial
+equilibrium model with four goods (food, non-food, care, domestic), four
+participation states per household, market clearing, and population
+re-allocation under counterfactuals.
 
-## Folder structure
+The earlier project under `existing_project/` implemented the same model
+with three goods (the food/non-food split was held in a side JSON but
+never integrated into the solver). This is a clean rebuild of the full
+specification, calibrated end-to-end from microdata.
+
+## Files
 
 ```
 project/
-├── README.md                       (this file)
-├── model.tex                       Model specification document
-├── model.pdf                       Compiled model document
-├── counterfactuals.py              Counterfactual experiments script
-├── counterfactuals.pdf             Counterfactual results (non-specialist report)
-├── counterfactual_results.csv      Per-county numerical results
-├── calibrate_food_extension.py     Food/non-food calibration
-├── calibrated_food_params.json     Calibrated food extension parameters
-├── kenya_counties.json             County centroids for the maps
-└── time_use_app/                   Main model code
-    ├── calibrated_params.json      Main calibration (phi=0.50, D_M_f=1.344)
-    ├── county_fundamentals.csv     Per-county wages, prices, populations
-    ├── calibrate.py                Main calibration script (from microdata)
-    ├── classes.py                  ModelParams + Household dataclasses
-    ├── functions.py                CES, PIGL, root-finding helpers
-    ├── solver.py                   6-equation fixed-point solver
-    ├── spatial.py                  47-county solver + counterfactual
-    ├── load_calibration.py         Loader for params + county data
-    ├── county.py                   County dataclass
-    ├── report.py                   Per-county simulation report (PDF)
-    └── simulation_report.pdf       (output of report.py)
+├── README.md                this file
+├── classes.py               ModelParams, Household, County dataclasses
+├── solver_functions.py      pure functions: CES, PIGL, household solver,
+│                            participation logit, spatial loop, migration
+├── calibrate.py             calibration script — reads .dta, writes outputs
+├── main.py                  Bokeh app
+├── calibrated_params.json   global structural parameters
+└── county_data.csv          47 county fundamentals
 ```
 
-## How to use
+## How to run
 
-1. **Run counterfactuals**: `python counterfactuals.py`
-   Produces `counterfactuals.pdf` with three policy experiments and
-   nine choropleth maps (3 indicators x 3 scenarios).
+### Calibrate from microdata
 
-2. **Inspect calibration**: open `model.pdf` for the full equation
-   listing and parameter values.
+```bash
+cd project
+python calibrate.py
+```
 
-3. **Re-run calibration from raw microdata** (requires the KCHS and
-   TUS files):
-   ```
-   cd time_use_app
-   python calibrate.py
-   ```
+Reads `time_use_final_ver13.dta`, `individuals_microdata.dta`,
+`consumption_aggregate_microdata.dta`, and `nonfood_items_microdata.dta`
+from `/mnt/user-data/uploads/`, and writes `calibrated_params.json` and
+`county_data.csv`. Runs end-to-end in roughly 60 seconds: about 2 seconds
+for the data manipulation blocks and the rest for two passes of solving
+all 47 counties (initial calibration + structural refinement of
+participation shifters).
 
-4. **Generate per-county simulation report** (47 county pages with
-   plots): `cd time_use_app && python report.py`. Slow (~10 min).
+### Launch the Bokeh app
 
-## Current calibration
+```bash
+bokeh serve --show project/main.py
+```
 
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| eps_engel | 0.291 | KCHS Engel curve |
-| beta_x    | 0.889 | KCHS share, residual goods |
-| beta_c    | 0.055 | KCHS market care share |
-| beta_d    | 0.056 | KCHS market domestic share |
-| kappa_x   | +0.069 | KCHS Engel slope |
-| kappa_c   | -0.034 | KCHS Engel slope |
-| kappa_d   | -0.035 | KCHS Engel slope |
-| phi       | 0.50  | Literature prior (was 0.032 from raw IV) |
-| rho       | -0.50 | Literature prior |
-| D_M_m     | 1.0   | Normalisation |
-| D_M_f     | 1.344 | Solver fixed-point match (formerly wrong: 0.383) |
-| D_c_m     | 1.0   | Normalisation |
-| D_c_f     | 0.766 | TUS hours ratio |
-| D_d_m     | 1.632 | TUS hours ratio |
-| D_d_f     | 0.337 | TUS hours ratio (sign issue, see model.pdf) |
-| omega_c   | 0.75  | Literature prior |
-| omega_d   | 0.70  | Literature prior |
-| eta_c     | 2.5   | Literature prior |
-| eta_d     | 2.5   | Literature prior |
-| wage_gap  | 0.831 | KCHS wage regression |
+Two side-by-side scenario columns. In each: a Kenya map, parameter
+inputs, Solve / Reset / Solve-all buttons, three counterfactual buttons,
+and three tabs (per-h plots, spatial summary, counterfactuals).
 
-See `model.pdf` Section 4 for the calibration strategy and
-`time_use_app/calibrated_params.json` for the full machine-readable
-file.
+Tap a county on the map to load its parameters; edit any input and click
+"Solve selected county" (200 ms) or "Solve all 47 counties" (~30–35 s)
+to update the spatial summary and enable counterfactuals. Each
+counterfactual takes another ~30–35 s.
 
-## Food/non-food extension status
+## Sanity-check values
 
-The food/non-food split is **calibrated** (see
-`calibrated_food_params.json`) but not yet integrated into the solver.
-The 8-equation extension to the solver is a follow-on task. Calibrated
-quantities for the extension:
+Headline calibrated quantities, with the targets I expected at calibration time:
 
-| Parameter   | Value  |
-|-------------|--------|
-| beta_xf     | 0.569  |
-| beta_xn     | 0.432  |
-| kappa_xf    | +0.283 |
-| kappa_xn    | -0.283 |
-| D_xf_m      | 1.0    |
-| D_xf_f      | 3.314  |
-| omega_xf    | 0.75   |
-| eta_xf      | 2.5    |
+| Parameter   | Value    | Target              | Source                                       |
+| ----------- | -------- | ------------------- | -------------------------------------------- |
+| `eps_engel` | 0.291    | ≈ 0.29              | KCHS food Engel curvature                    |
+| `wage_gap`  | 0.831    | ≈ 0.83              | KCHS Mincer regression                       |
+| `D_M_f`     | 1.343    | ≈ 1.34              | TUS market hours, married subsample          |
+| `D_xf_f`    | 0.269    | (see correction below) | TUS food-prep hours                       |
+| `D_c_f`     | 0.766    |                     | TUS home-care hours                          |
+| `D_d_m`     | 1.630    |                     | Intra-male home-domestic vs. home-care ratio |
+| `D_d_f`     | 0.336    |                     | TUS home-domestic hours                      |
+| `phi`       | 0.5      | literature prior    | Frisch elasticity (KCHS IV biased downward)  |
+| `rho`       | −0.5     | literature prior    | CES disutility curvature                     |
+| `Ubar`      | 3.4368   |                     | Population-weighted V*                       |
+| `V*` range  | [3.40, 3.56] |                 | After spatial solve                          |
+| `ξ` range   | [−0.12, 0.04] |                | After amenity calibration                    |
+| County wages | [30, 261] KSh/hr |             | KCHS labour module                           |
 
-Food prep hours (TUS code t231):
-- Men:   11.3 h/wk conditional, 23.7% participate
-- Women: 20.6 h/wk conditional, 90.7% participate
+Participation rates after the structural refinement of `(σ_u, ū)`:
+- Implied national `P_m = 0.58` against observed `P_m_obs = 0.55`
+- Implied national `P_f = 0.39` against observed `P_f_obs = 0.34`
 
-## Counterfactual results (national averages)
+Both within roughly 5 percentage points of observed — close enough that
+the counterfactuals reflect the data-anchored elasticity rather than
+arbitrary calibration choices.
 
-| Scenario              | GDP    | Female participation | F/M hours ratio |
-|-----------------------|--------|----------------------|-----------------|
-| Wage gap closed       | +3.83% | +0.07 pp             | +6.56 pp        |
-| Care price -30%       | +0.01% |  0.00 pp             |  0.00 pp        |
-| Domestic price -30%   | +0.03% |  0.00 pp             |  0.00 pp        |
+### `D_xf_f` — correction relative to the existing food JSON
 
-Care and domestic price reductions give near-zero effects because the
-expenditure shares of those services are tiny (~5% of budget) and
-service demand is income-inelastic. The wage gap closure is the only
-counterfactual with a clear macroeconomic effect.
+The existing project's `calibrated_food_params.json` has `D_xf_f = 3.314`,
+calibrated via `D_xf_f = D_xf_m × (L^xf_m / L^xf_f)^(1/ρ)`. This sign is
+**wrong** for solver consistency: my solver's update map (matching
+eq. 22 of the document) implies
+
+```
+L^j_m / L^j_f = (D^m_j / D^f_j)^ρ        ⇒        D^f_j = D^m_j × r_j^(−1/ρ)
+```
+
+where `r_j = L^j_m / L^j_f` is the observed gender ratio. With
+`L^xf_m = 11.52`, `L^xf_f = 22.20`, and `ρ = −0.5`, the correct value is
+
+```
+D^f_xf = 1 × 0.519^(−1/−0.5) = 0.519² = 0.269
+```
+
+The same formula was used (correctly) in the existing project for
+`D_c_f` and `D_d_f`. Only the food extension JSON had the inverted sign.
+Because the food extension JSON was never integrated into the existing
+solver, this never caused observable issues in the existing 3-good app
+— but the new value (0.27) is the correct one and is what this solver
+expects.
+
+### `kappa` scale — `E_sol = 0.5`, not data median
+
+`κ_i = −slope_i · E^(1+ε) / ε`, evaluated at the expenditure scale that
+the **solver** sees, not the **data** median. KCHS gives a median per-
+adult-equivalent annual expenditure of `~6.0` (in 1000-KSh units), but
+when the household solver evaluates one of the calibrated counties at
+the median wage, it sees `E ≈ 0.3–0.5` (1000-KSh per period). Using
+`E_sol = 0.5` keeps the κ magnitudes self-consistent with the solver's
+λ fixed point. This matches the choice made in the existing project's
+food extension calibration.
+
+### `p_xf` — uniform national, defended for peer review
+
+The document offers two normalisations for the food sector
+(Section 21.2): (1) a uniform national price `p_xf` with
+`A^M,xf_l = w_l / p_xf`; or (2) a uniform national TFP `A^M,xf = 1`
+with `p_xf_l = w_l`. We adopt option (1), with `p_xf` set to the
+population-weighted mean of `(p_c, p_d)` so that food prices live on
+the same numerical scale as service prices (`p_xf = 0.0561` in
+1000-KSh units, ≈ 56 KSh/hr-equivalent).
+
+The defence: option (2) makes high-wage counties counterfactually
+expensive in food, which would mechanically depress their food
+expenditure share relative to KCHS data — a check easy for a reviewer
+to fail. Option (1) is closer to reality for Kenyan staples (maize,
+sugar, cooking oil), which trade substantially across counties and have
+prices that don't co-move 1-for-1 with wages. The remaining county
+heterogeneity in food production sits in `A^M,xf_l = w_l / p_xf`,
+defensible as "labour productivity in the food-producing sector tracks
+the local wage", which is exactly what the free-entry pricing condition
+implies.
+
+## Sign-correctness items preserved from the existing project
+
+1. **`D^f_M ≈ 1.34`** — solver-consistent formula `r_M / wage_gap^ρ` (calibrated to 1.343).
+2. **County `D` weight shrinkage** — Bayesian prior with `n_0 = 20` toward the national ratio; `n_eff` is the geometric mean of male/female cell counts.
+3. **Population-weighted migration** — `solver_functions.migration_update` uses the variant from eq. 38–39 with population-weighted `Ubar`, so that at the baseline equilibrium `N' = N` exactly.
+4. **Home/market plot uses expenditure shares** — the home-vs-market plot in main.py shows `P_iH·S_iH / (P_i·S_i)` and `p_i·S_iM / (P_i·S_i)`, which sum to 1 by the CES envelope. Quantity ratios would not.
+5. **`φ = 0.5` literature prior** — used directly, not the KCHS IV estimate (which is biased downward by classical measurement error in hours).
+
+New for the 4-good model:
+
+6. **`D^f_xf ≈ 0.27`** from `(L^xf_m / L^xf_f)^(−1/ρ)` — see correction note above.
+7. **Participation shifters refit structurally** — using actual ΔV from the four-state solve at the population-mean county, rather than the educational-premium proxy used in the existing 3-good code.
 
 ## Known limitations
 
-- County populations (`N_tus` in `county_fundamentals.csv`) are raw
-  TUS person-day weight sums (~10^8), not census populations. This
-  affects absolute GDP levels; relative changes are unaffected.
-- Three counties have unreliable service prices: Homa Bay (p_d=3),
-  Kakamega (p_c=351), Tharaka-Nithi (p_d=110).
-- Home TFP A_c, A_d set to 1 everywhere (not identified).
-- sigma_mig = 1.0 in the spatial migration equation is uncalibrated.
-- The Block E parameters (sigma_u_g, u_bar_g) were estimated at the
-  old phi=0.032; with the new phi=0.50 they would shift.
+- **Population is TUS-weighted, not census.** `N_l` is the sum of TUS
+  person-day weights per county. This is what the existing project does
+  and what we agreed for this rebuild; for a paper-grade run, swap in
+  KNBS census counts.
+- **`σ_mig = 1.0` is uncalibrated.** No internal-migration-elasticity
+  estimate exists in our data. The literature value is fine for
+  comparative-statics counterfactuals (which is what the app does);
+  not fine for absolute migration magnitudes.
+- **Home productivities `A^H,i_l = 1`.** Not separately identified from
+  TUS time-use alone (would require home-output prices we don't have).
+- **`h`-grid is coarse: `[0.5, 1.0, 2.0, 3.0]`.** Per-h plots are
+  jagged for that reason. Adding more grid points scales the per-county
+  solve time linearly.
+- **No endogenous `h_m, h_f`.** As locked in the Phase 1 plan.
+- **No endogenous prices.** Productivities are primitives; prices follow
+  via the free-entry identities, but inter-county trade in `xn` is
+  reported as a residual diagnostic rather than enforced as a binding
+  constraint.
 
-## Bokeh app
+## Performance notes
 
-A two-panel side-by-side comparison app lives at
-`time_use_app/main.py`.
+On the calibration container:
 
-### Run
+- **`python calibrate.py`** — about 60 seconds end-to-end (two passes of
+  47-county solve plus the data manipulation blocks).
+- **Single-county Solve** in the app — about 200 ms (essentially feels
+  instant).
+- **"Solve all 47 counties"** in the app — about 30–35 seconds.
+- **One counterfactual** in the app — another 30–35 seconds.
 
-```bash
-cd <project_root>
-bokeh serve time_use_app/ --show
-```
+The solver is intentionally not parallelised; the 4-state participation
+and adaptive damping make per-county work fairly heterogeneous and the
+overhead of multiprocessing across only 47 counties wouldn't help much.
+If the 30s wait becomes painful, the cleanest optimisation is to cache
+results per county and only re-solve those whose parameters changed
+between successive Solve-all clicks.
 
-The app opens at `http://localhost:5006/time_use_app`.
+## Calibration sources
 
-### Features
+- TUS activity codes: `t11` (market work), `t13` (home domestic),
+  `t14` (home care), `t231` (food preparation). All in minutes per day,
+  converted to hours per week with factor `7/60`.
+- KCHS labour module: `d40_gross` (employee monthly income),
+  `d48_amount` (self-employed monthly income), `d27` (usual weekly
+  hours). Hourly wage = monthly income / (weekly hours × 4.333).
+- KCHS expenditure aggregate: `padqfdcons` (food); COICOP 13 from the
+  non-food items file (personal care); COICOP 5 (domestic services).
+  Non-food residual = 1 − food − care − domestic.
+- ISIC codes for service-sector wages: 9700/9800 for domestic,
+  8891/8810/8730 for care.
 
-- **Two scenario columns (A / B)** with identical controls, allowing you
-  to compare two parameter configurations side-by-side.
-- **Kenya map at the top** of each column. Click a county to load its
-  parameters into the editor below. Color-code by wage, baseline female
-  participation, or last counterfactual ΔGDP.
-- **Global parameters editor** (18 fields): PIGL, CES, ρ, φ, wage_gap,
-  σ_u, ū. These are shared across all counties in that scenario.
-- **County-specific parameters editor** (12 fields): w_ell, p_c, p_d,
-  A_c, A_d, N, and the six D weights. Loaded from the calibrated CSVs
-  on first display, editable thereafter.
-- **Solve buttons**:
-  - "Solve selected county" (~0.1 s) — re-solves only the displayed
-    county and updates the per-h plots.
-  - "Solve all 47 counties" (~3-5 s, on the Spatial tab) — re-solves
-    every county; required before counterfactuals.
-- **Counterfactual buttons** on the Counterfactuals tab: wage_gap = 1,
-  p^c × 0.7, p^d × 0.7. Each updates both the summary table and the
-  nine choropleth maps (3 indicators × 3 scenarios).
-- **Tabs**:
-  - Per-h plots (selected county): hours, gaps, shares, home/market.
-  - Spatial: V* vs wage, ξ ranking, gender hours-ratio.
-  - Counterfactuals: summary table + 9 maps.
-
-### Caveats
-
-- Page is wide (~2400 px). Use a monitor ≥ 1920 px or expect horizontal
-  scrolling.
-- The food/non-food extension is calibrated (see
-  `calibrated_food_params.json`) but not integrated into the 6-equation
-  solver yet. Activation pending the 8-equation solver rewrite. The
-  food parameters can still be inspected by reading the JSON.
+All quantities stored in **1000-KSh units** in `calibrated_params.json`
+and `county_data.csv` so loaders don't have to scale.

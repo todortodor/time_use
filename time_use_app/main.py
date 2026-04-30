@@ -1,707 +1,815 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-main.py — Bokeh app for the Kenya Time-Use spatial equilibrium model.
+main.py — Bokeh app for the Kenya 4-good time-use spatial equilibrium model.
 
-Two side-by-side scenario columns (A and B) for comparison. Each column has:
+Two side-by-side scenario columns (A and B) for comparison.  Each column has:
 
   • A clickable Kenya map (centroid circles) at the top for county selection.
-  • Global parameters section (PIGL, CES, rho, phi, wage_gap, sigma_u, u_bar).
+  • Global parameters section (PIGL 4 goods, CES, rho, phi, wage_gap, p_xf,
+    sigma_u, u_bar, sigma_mig).
   • County-specific parameters section (auto-loaded for the selected county):
-    w_ell, pc, pd, A_c, A_d, N, and the six D weights.
-  • Solve / Reset buttons.
+    w_ell, p_xf, pc, pd, AM_xn, AM_xf, AM_c, AM_d, N, plus 5 free D weights.
+    Constants D_M_m = D_xf_m = D_c_m = 1 are hidden.
+  • Solve / Reset / Solve-all buttons.
   • Counterfactual panel with three buttons (wage_gap=1, p^c×0.7, p^d×0.7).
   • Tabs:
-      - Per-h plots (for the selected county): hours, gaps, shares, home/market
-      - Spatial: V*, xi, gender gap by county (requires "Solve all 47")
-      - Counterfactuals: summary table + nine choropleth maps
-                         (requires "Solve all 47" first)
+      - Per-h plots     (selected county): hours (8 lines), gaps (4),
+                        PIGL shares (4 goods), home/market shares (6),
+                        participation rates P_m / P_f
+      - Spatial summary (requires "Solve all 47"): V* vs wage scatter,
+                        ξ ranking bar, gender-ratio scatter, sectoral shares
+      - Counterfactuals (requires "Solve all 47"): summary table +
+                        12 choropleth maps (3 scenarios × 4 indicators)
 
 Run with:
-    bokeh serve --show main.py
-
-Notes:
-  - The food/non-food extension is documented in the model PDF and calibrated
-    in calibrated_food_params.json, but the underlying solver does not yet
-    integrate it. The food parameters appear in the app as read-only display
-    fields with a note. Activation pending the 8-equation solver rewrite.
+    bokeh serve --show /home/claude/project/main.py
 """
 from __future__ import annotations
 
-import copy
 import json
 import math
-import os
-from dataclasses import replace as dc_replace
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row, Spacer
 from bokeh.models import (
-    Button, ColumnDataSource, Div, HoverTool, Legend, NumericInput,
+    Button, ColumnDataSource, Div, HoverTool, NumericInput,
     Select, Tabs, TabPanel, DataTable, TableColumn, NumberFormatter,
     LinearColorMapper, ColorBar, BasicTicker,
 )
 from bokeh.plotting import figure
-from bokeh.palettes import RdBu11, PiYG11, PuOr11
-from bokeh.events import Tap
+from bokeh.palettes import RdBu11
 
-# Local imports — model code in the same folder
-from classes import ModelParams, Household
-from solver import SolverState, solve_model
-
-# ═══════════════════════════════════════════════════════════════════════
-# Paths and constants
-# ═══════════════════════════════════════════════════════════════════════
-
+# Local imports
 HERE = Path(__file__).parent
-ROOT = HERE.parent
-
-PARAMS_PATH      = HERE / "calibrated_params.json"
-FUND_PATH        = HERE / "county_fundamentals.csv"
-DCNTY_PATH       = HERE / "county_D_weights.csv"
-FOOD_PATH        = ROOT / "calibrated_food_params.json"
-COUNTIES_GEO     = ROOT / "kenya_counties.json"
-
-E_SCALE = 1000.0   # KSh -> 1000-KSh, consistent with the rest of the project
-
-# County names (1..47) and centroids — stored in kenya_counties.json
-def _load_county_centroids():
-    with open(COUNTIES_GEO) as f:
-        d = json.load(f)
-    # JSON: {"1": ["Mombasa", lat, lon], ...}
-    centroids = {}
-    for k, v in d.items():
-        centroids[int(k)] = {"name": v[0], "lat": v[1], "lon": v[2]}
-    return centroids
+sys.path.insert(0, str(HERE))
+from classes import ModelParams, County
+from solver_functions import (
+    solve_county_household, solve_all_counties, calibrate_amenities,
+    compute_market_clearing, run_counterfactual,
+)
 
 
-COUNTY = _load_county_centroids()
-N_COUNTIES = len(COUNTY)
+# =========================================================================== #
+# Paths and constants                                                         #
+# =========================================================================== #
+
+PARAMS_PATH = HERE / "calibrated_params.json"
+COUNTY_PATH = HERE / "county_data.csv"
+
+E_SCALE = 1000.0          # KSh -> 1000-KSh
+H_GRID  = np.array([0.5, 1.0, 2.0, 3.0])
+
+# Plot dims
+H_FIG = 230
+W_FIG = 380
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Calibration loader
-# ═══════════════════════════════════════════════════════════════════════
+# =========================================================================== #
+# Data loading                                                                #
+# =========================================================================== #
 
-def load_baseline() -> dict:
-    """
-    Load the full baseline calibration into a single nested dict:
-      {
-        'global':  {eps_engel, beta_x, beta_c, beta_d, kappa_*, omega_*,
-                    eta_*, rho, phi, wage_gap,
-                    sigma_u_m, sigma_u_f, u_bar_m, u_bar_f},
-        'food':    {beta_xf, beta_xn, kappa_xf, kappa_xn, D_xf_m, D_xf_f,
-                    omega_xf, eta_xf, A_xf, ...},
-        'counties': {1: {w_ell, pc, pd, A_c, A_d, N, D_M_m, D_c_m, D_d_m,
-                         D_M_f, D_c_f, D_d_f}, ..., 47: {...}}
-      }
-    """
-    import pandas as pd
+def _load_baseline():
+    with PARAMS_PATH.open() as f:
+        params = json.load(f)
+    cdf = pd.read_csv(COUNTY_PATH)
+    cdf["county_id"] = cdf["county_id"].astype(int)
 
-    with open(PARAMS_PATH) as f:
-        p = json.load(f)
-    glob = {
-        "eps_engel": p["eps_engel"],
-        "beta_x":    p["beta_x"], "beta_c": p["beta_c"], "beta_d": p["beta_d"],
-        "kappa_x":   p["kappa_x"],"kappa_c":p["kappa_c"],"kappa_d":p["kappa_d"],
-        "omega_c":   p["omega_c"],"omega_d":p["omega_d"],
-        "eta_c":     p["eta_c"],  "eta_d":  p["eta_d"],
-        "rho":       p["rho"],    "phi":    p["phi"],
-        "wage_gap":  p["wage_gap"],
-        "sigma_u_m": p.get("sigma_u_m", 3.144),
-        "sigma_u_f": p.get("sigma_u_f", 1.894),
-        "u_bar_m":   p.get("u_bar_m",   1.933),
-        "u_bar_f":   p.get("u_bar_f",   3.762),
-    }
-
-    food = {}
-    if FOOD_PATH.exists():
-        with open(FOOD_PATH) as f:
-            food = json.load(f)
-
-    fund = pd.read_csv(FUND_PATH)
-    Dcty = pd.read_csv(DCNTY_PATH).set_index("county") if DCNTY_PATH.exists() else None
-
-    counties: Dict[int, Dict[str, float]] = {}
-    for _, row in fund.iterrows():
-        cnum = int(row["county"])
-        # wages and prices in KSh -> 1000-KSh units
-        w_ell = float(row["w_ell"]) / E_SCALE
-        pc_raw = row.get("pc")
-        if pc_raw is None or (isinstance(pc_raw, float) and np.isnan(pc_raw)):
-            pc_raw = row.get("w_care", np.nan)
-        if isinstance(pc_raw, float) and np.isnan(pc_raw):
-            pc_raw = 68.7
-        pc = float(pc_raw) / E_SCALE
-        pd_raw = row.get("pd")
-        if pd_raw is None or (isinstance(pd_raw, float) and np.isnan(pd_raw)):
-            pd_raw = row.get("w_domestic", np.nan)
-        if isinstance(pd_raw, float) and np.isnan(pd_raw):
-            pd_raw = 34.9
-        pd_v = float(pd_raw) / E_SCALE
-
-        d = {
-            "w_ell": w_ell, "pc": pc, "pd": pd_v,
-            "A_c":   float(row.get("A_c_proxy", 1.0)),
-            "A_d":   float(row.get("A_d_proxy", 1.0)),
-            "N":     float(row.get("N_tus", 1.0)),
+    # Build the baseline dictionary (used for reset)
+    counties: Dict[int, dict] = {}
+    for _, r in cdf.iterrows():
+        cid = int(r["county_id"])
+        counties[cid] = {
+            "name": r["name"], "lat": float(r["lat"]), "lon": float(r["lon"]),
+            "w_ell": float(r["w_ell"]),
+            "p_xf":  float(r["p_xf"]),
+            "pc":    float(r["pc"]),
+            "pd":    float(r["pd"]),
+            "AM_xn": float(r["AM_xn"]),
+            "AM_xf": float(r["AM_xf"]),
+            "AM_c":  float(r["AM_c"]),
+            "AM_d":  float(r["AM_d"]),
+            "A_xf_home": float(r["A_xf_home"]),
+            "A_c_home":  float(r["A_c_home"]),
+            "A_d_home":  float(r["A_d_home"]),
+            "N":     float(r["N"]),
+            "D_M_m": float(r["D_M_m"]), "D_xf_m": float(r["D_xf_m"]),
+            "D_c_m": float(r["D_c_m"]), "D_d_m":  float(r["D_d_m"]),
+            "D_M_f": float(r["D_M_f"]), "D_xf_f": float(r["D_xf_f"]),
+            "D_c_f": float(r["D_c_f"]), "D_d_f":  float(r["D_d_f"]),
+            # Calibrated quantities (optional: blank -> NaN)
+            "V_star": float(r["V_star"]) if r["V_star"] != "" else float("nan"),
+            "P_m":    float(r["P_m"])    if r["P_m"]    != "" else float("nan"),
+            "P_f":    float(r["P_f"])    if r["P_f"]    != "" else float("nan"),
+            "xi":     float(r["xi"])     if r["xi"]     != "" else float("nan"),
         }
-        if Dcty is not None and cnum in Dcty.index:
-            r = Dcty.loc[cnum]
-            d.update({
-                "D_M_m": float(r["D_M_m"]), "D_c_m": float(r["D_c_m"]),
-                "D_d_m": float(r["D_d_m"]),
-                "D_M_f": float(r["D_M_f"]), "D_c_f": float(r["D_c_f"]),
-                "D_d_f": float(r["D_d_f"]),
-            })
-        else:
-            d.update({"D_M_m": p["D_M_m"], "D_c_m": p["D_c_m"],
-                      "D_d_m": p["D_d_m"], "D_M_f": p["D_M_f"],
-                      "D_c_f": p["D_c_f"], "D_d_f": p["D_d_f"]})
-        counties[cnum] = d
-
-    return {"global": glob, "food": food, "counties": counties}
+    return params, counties
 
 
-BASELINE = load_baseline()
+BASELINE_PARAMS, BASELINE_COUNTIES = _load_baseline()
+COUNTY_NAMES = {cid: BASELINE_COUNTIES[cid]["name"]
+                for cid in BASELINE_COUNTIES}
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Solver wrappers
-# ═══════════════════════════════════════════════════════════════════════
-
-def build_mp(global_params: dict, county_params: dict) -> ModelParams:
-    """Construct a ModelParams from current global + county-specific values."""
-    return ModelParams(
-        eps_engel=global_params["eps_engel"],
-        beta_x=global_params["beta_x"], beta_c=global_params["beta_c"],
-        beta_d=global_params["beta_d"],
-        kappa_x=global_params["kappa_x"], kappa_c=global_params["kappa_c"],
-        kappa_d=global_params["kappa_d"],
-        omega_c=global_params["omega_c"], omega_d=global_params["omega_d"],
-        eta_c=global_params["eta_c"],     eta_d=global_params["eta_d"],
-        D_M_m=county_params["D_M_m"], D_c_m=county_params["D_c_m"],
-        D_d_m=county_params["D_d_m"],
-        D_M_f=county_params["D_M_f"], D_c_f=county_params["D_c_f"],
-        D_d_f=county_params["D_d_f"],
-        rho=global_params["rho"], phi=global_params["phi"],
-    )
-
-
-H_GRID = np.array([0.5, 1.0, 2.0, 3.0])
-
-
-def solve_county(global_params: dict, county_params: dict,
-                 a: float = 0.2) -> dict:
-    """Solve one county over the h-grid. Returns dict of arrays."""
-    mp = build_mp(global_params, county_params)
-    wage_gap = float(global_params["wage_gap"])
-    Nh = len(H_GRID)
-
-    LM_m = np.full(Nh, np.nan); LM_f = np.full(Nh, np.nan)
-    Lc_m = np.full(Nh, np.nan); Lc_f = np.full(Nh, np.nan)
-    Ld_m = np.full(Nh, np.nan); Ld_f = np.full(Nh, np.nan)
-    E_arr = np.full(Nh, np.nan); V_arr = np.full(Nh, np.nan)
-    th_x = np.full(Nh, np.nan); th_c = np.full(Nh, np.nan); th_d = np.full(Nh, np.nan)
-    ScH_share = np.full(Nh, np.nan); ScM_share = np.full(Nh, np.nan)
-    SdH_share = np.full(Nh, np.nan); SdM_share = np.full(Nh, np.nan)
-    conv = np.zeros(Nh, dtype=bool)
-
-    state = SolverState(verbose=False, max_iter=20000, tol=1e-8,
-                        damping=0.15, adapt_damping=True)
-    L_guess = (0.15, 0.10, 0.05, 0.10, 0.04, 0.08)
-
-    for i, h in enumerate(H_GRID):
-        y_m = float(county_params["w_ell"] * h)
-        y_f = float(wage_gap * county_params["w_ell"] * h)
-        hh = Household(
-            params=mp, y_m=y_m, y_f=y_f,
-            pc=float(county_params["pc"]), pd=float(county_params["pd"]),
-            a=a, A_c=float(county_params["A_c"]), A_d=float(county_params["A_d"]),
-        )
-        try:
-            hh, state = solve_model(mp, hh, state, L0=L_guess)
-            LM_m[i] = state.LM_m; LM_f[i] = state.LM_f
-            Lc_m[i] = state.Lc_m; Lc_f[i] = state.Lc_f
-            Ld_m[i] = state.Ld_m; Ld_f[i] = state.Ld_f
-            E_arr[i] = float(hh.E)
-            th_x[i] = float(hh.th_x); th_c[i] = float(hh.th_c); th_d[i] = float(hh.th_d)
-            Sc_tot = float(hh.Sc); Sd_tot = float(hh.Sd)
-            # Expenditure shares: P_iH * S_iH / (P_i * S_i). These sum to 1
-            # by the CES envelope condition. Quantity ratios (S_iH/S_i) do
-            # NOT sum to 1 because S_i is the CES composite, not a sum.
-            if Sc_tot > 0 and hh.Pc > 0:
-                ScH_share[i] = (hh.PcH * hh.ScH) / (hh.Pc * Sc_tot)
-                ScM_share[i] = (hh.pc  * hh.ScM) / (hh.Pc * Sc_tot)
-            if Sd_tot > 0 and hh.Pd > 0:
-                SdH_share[i] = (hh.PdH * hh.SdH) / (hh.Pd * Sd_tot)
-                SdM_share[i] = (hh.pd  * hh.SdM) / (hh.Pd * Sd_tot)
-            # Value (per Block E)
-            V_arr[i] = (hh.E / hh.B) ** mp.eps_engel / mp.eps_engel - \
-                       hh.L ** (1.0 + 1.0 / mp.phi) / (1.0 + 1.0 / mp.phi)
-            conv[i] = state.converged
-            L_guess = tuple(max(1e-14, v) for v in
-                            [state.LM_m, state.LM_f, state.Lc_m,
-                             state.Lc_f, state.Ld_m, state.Ld_f])
-        except Exception:
-            pass
-
-    # Female participation from logit (Block E)
-    sigma_u = global_params["sigma_u_f"]; u_bar = global_params["u_bar_f"]
-    V_P = global_params["phi"] * county_params["w_ell"] * wage_gap * H_GRID
-    Pf = 1.0 / (1.0 + np.exp((u_bar - V_P) / max(sigma_u, 1e-9)))
-
-    return {
-        "h": H_GRID, "LM_m": LM_m, "LM_f": LM_f,
-        "Lc_m": Lc_m, "Lc_f": Lc_f, "Ld_m": Ld_m, "Ld_f": Ld_f,
-        "E": E_arr, "V": V_arr, "Pf": Pf,
-        "th_x": th_x, "th_c": th_c, "th_d": th_d,
-        "ScH_share": ScH_share, "ScM_share": ScM_share,
-        "SdH_share": SdH_share, "SdM_share": SdM_share,
-        "converged": conv, "n_conv": int(conv.sum()),
-        "N_county": float(county_params["N"]),
-        "wage": float(county_params["w_ell"] * E_SCALE),  # back to KSh/hr
-    }
-
-
-def solve_all_counties(global_params: dict,
-                       counties_params: Dict[int, dict]) -> Dict[int, dict]:
-    """Solve every county. Returns {county_id: result_dict}."""
-    out = {}
-    for cnum, cp in counties_params.items():
-        out[cnum] = solve_county(global_params, cp)
-    return out
-
-
-def summarise_spatial(results: Dict[int, dict]) -> dict:
-    """National summary metrics."""
-    Vstar = np.array([np.nanmean(results[c]["V"]) for c in sorted(results)])
-    GDP   = np.array([np.nanmean(results[c]["E"]) * results[c]["N_county"]
-                      for c in sorted(results)])
-    Pf    = np.array([np.nanmean(results[c]["Pf"]) for c in sorted(results)])
-    LMm   = np.array([np.nanmean(results[c]["LM_m"]) for c in sorted(results)])
-    LMf   = np.array([np.nanmean(results[c]["LM_f"]) for c in sorted(results)])
-    ratio = LMf / np.maximum(LMm, 1e-9)
-    wages = np.array([results[c]["wage"] for c in sorted(results)])
-    # Calibrate amenities so weighted mean V* + xi = 0
-    weights = np.array([results[c]["N_county"] for c in sorted(results)])
-    Ubar = float(np.average(Vstar, weights=weights))
-    xi = Ubar - Vstar
-    return {"counties": sorted(results.keys()),
-            "Vstar": Vstar, "GDP": GDP, "Pf": Pf,
-            "LM_m": LMm, "LM_f": LMf, "ratio": ratio,
-            "wages": wages, "xi": xi, "Ubar": Ubar}
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# UI helpers
-# ═══════════════════════════════════════════════════════════════════════
+# =========================================================================== #
+# UI field definitions                                                        #
+# =========================================================================== #
 
 GLOBAL_FIELDS = [
-    ("eps_engel", "ε (Engel)"), ("rho", "ρ (CES disutility)"),
-    ("phi", "φ (Frisch elast.)"), ("wage_gap", "wage_gap"),
-    ("beta_x", "β_x"), ("beta_c", "β_c"), ("beta_d", "β_d"),
-    ("kappa_x", "κ_x"), ("kappa_c", "κ_c"), ("kappa_d", "κ_d"),
-    ("omega_c", "ω_c"), ("omega_d", "ω_d"),
-    ("eta_c", "η_c"), ("eta_d", "η_d"),
-    ("sigma_u_m", "σ_u^m"), ("sigma_u_f", "σ_u^f"),
-    ("u_bar_m", "ū^m"),     ("u_bar_f", "ū^f"),
+    ("eps_engel", "ε (Engel)"),
+    ("rho",       "ρ (CES disutility)"),
+    ("phi",       "φ (Frisch elast.)"),
+    ("wage_gap",  "wage_gap"),
+    ("p_xf",      "p_xf (national)"),
+    ("beta_xf",   "β_xf"),  ("beta_xn",  "β_xn"),
+    ("beta_c",    "β_c"),   ("beta_d",   "β_d"),
+    ("kappa_xf",  "κ_xf"),  ("kappa_xn", "κ_xn"),
+    ("kappa_c",   "κ_c"),   ("kappa_d",  "κ_d"),
+    ("omega_xf",  "ω_xf"),  ("omega_c",  "ω_c"),  ("omega_d",  "ω_d"),
+    ("eta_xf",    "η_xf"),  ("eta_c",    "η_c"),  ("eta_d",    "η_d"),
+    ("sigma_u_m", "σ_u^m"), ("sigma_u_f","σ_u^f"),
+    ("u_bar_m",   "ū^m"),   ("u_bar_f",  "ū^f"),
+    ("sigma_mig", "σ_mig"),
 ]
 
+# Constant D weights (D_M_m = D_xf_m = D_c_m = 1) are hidden in the UI.
+# D_d_m varies by county (intra-male c-vs-d ratio), so it shows.
 COUNTY_FIELDS = [
-    ("w_ell", "wage (1000-KSh/hr)"),
-    ("pc", "p_c (1000-KSh/hr)"), ("pd", "p_d (1000-KSh/hr)"),
-    ("A_c", "A_c (home TFP)"),  ("A_d", "A_d (home TFP)"),
-    ("N", "N (population)"),
-    ("D_M_m", "D_M^m"), ("D_M_f", "D_M^f"),
-    ("D_c_m", "D_c^m"), ("D_c_f", "D_c^f"),
-    ("D_d_m", "D_d^m"), ("D_d_f", "D_d^f"),
+    ("w_ell",  "wage (1000-KSh/hr)"),
+    ("p_xf",   "p_xf (county; usually = global)"),
+    ("pc",     "p_c (1000-KSh/hr)"),
+    ("pd",     "p_d (1000-KSh/hr)"),
+    ("AM_xn",  "A^M,xn (= w)"),
+    ("AM_xf",  "A^M,xf (= w/p_xf)"),
+    ("AM_c",   "A^M,c (= w/p_c)"),
+    ("AM_d",   "A^M,d (= w/p_d)"),
+    ("N",      "N (population)"),
+    ("D_M_f",  "D_M^f"),
+    ("D_xf_f", "D_xf^f"),
+    ("D_c_f",  "D_c^f"),
+    ("D_d_m",  "D_d^m"),
+    ("D_d_f",  "D_d^f"),
 ]
 
 
-def make_county_map(map_source: ColumnDataSource,
-                    cmap_source: ColumnDataSource,
-                    title: str = "Click a county") -> figure:
-    """Centroid-circle Kenya map. Tap selects a county."""
-    p = figure(
-        title=title, width=380, height=420,
-        x_range=(33.2, 42.6), y_range=(-5.2, 5.2),
-        tools="tap,hover,reset",
-        active_tap="auto",
-        toolbar_location="right",
+def _build_mp(global_p: dict) -> ModelParams:
+    """Build a ModelParams from the (possibly user-edited) global_p dict.
+
+    The 8 D weights in ModelParams are placeholder national defaults; the
+    actual per-county D weights live in the County dict and override these
+    for each county solve.
+    """
+    return ModelParams(
+        eps_engel=float(global_p["eps_engel"]),
+        beta_xf=float(global_p["beta_xf"]),
+        beta_xn=float(global_p["beta_xn"]),
+        beta_c=float(global_p["beta_c"]),
+        beta_d=float(global_p["beta_d"]),
+        kappa_xf=float(global_p["kappa_xf"]),
+        kappa_xn=float(global_p["kappa_xn"]),
+        kappa_c=float(global_p["kappa_c"]),
+        kappa_d=float(global_p["kappa_d"]),
+        omega_xf=float(global_p["omega_xf"]),
+        omega_c=float(global_p["omega_c"]),
+        omega_d=float(global_p["omega_d"]),
+        eta_xf=float(global_p["eta_xf"]),
+        eta_c=float(global_p["eta_c"]),
+        eta_d=float(global_p["eta_d"]),
+        D_M_m=1.0, D_xf_m=1.0, D_c_m=1.0,  # placeholder (county overrides)
+        D_d_m=float(BASELINE_PARAMS["D_d_m"]),
+        D_M_f=float(BASELINE_PARAMS["D_M_f"]),
+        D_xf_f=float(BASELINE_PARAMS["D_xf_f"]),
+        D_c_f=float(BASELINE_PARAMS["D_c_f"]),
+        D_d_f=float(BASELINE_PARAMS["D_d_f"]),
+        rho=float(global_p["rho"]),
+        phi=float(global_p["phi"]),
+        sigma_u_m=float(global_p["sigma_u_m"]),
+        sigma_u_f=float(global_p["sigma_u_f"]),
+        u_bar_m=float(global_p["u_bar_m"]),
+        u_bar_f=float(global_p["u_bar_f"]),
+        wage_gap=float(global_p["wage_gap"]),
+        p_xf=float(global_p["p_xf"]),
+        sigma_mig=float(global_p["sigma_mig"]),
     )
-    p.xaxis.visible = False
-    p.yaxis.visible = False
-    p.xgrid.visible = False
-    p.ygrid.visible = False
-    p.background_fill_color = "#f0f4f8"
-    # Faint outline of Kenya
-    p.line([33.7, 42.2, 42.2, 33.7, 33.7],
-           [-4.8, -4.8, 4.5, 4.5, -4.8],
-           color="#888", line_dash="dotted", line_width=1)
 
-    cmap = LinearColorMapper(palette=RdBu11, low=-1, high=1)
-    r = p.scatter(
-        x="lon", y="lat", source=map_source, size=14,
-        fill_color={"field": "value", "transform": cmap},
-        line_color="black", line_width=0.5,
+
+def _build_county(cp: dict, cid: int, mp: ModelParams) -> County:
+    """Build a County from the (possibly user-edited) per-county dict.
+
+    The county's D weights override the placeholder ones in mp via the
+    Household solver code path, which uses mp.D_*_g.  Therefore for per-
+    county solves we construct a *county-specific* mp with the county's D
+    weights inserted.  This mirrors the existing 3-good app pattern.
+    """
+    return County(
+        name=cp["name"], county_id=cid,
+        lat=float(cp["lat"]), lon=float(cp["lon"]),
+        w_ell=float(cp["w_ell"]),
+        p_xf=float(cp["p_xf"]),
+        pc=float(cp["pc"]),  pd=float(cp["pd"]),
+        AM_xn=float(cp["AM_xn"]), AM_xf=float(cp["AM_xf"]),
+        AM_c=float(cp["AM_c"]),   AM_d=float(cp["AM_d"]),
+        A_xf_home=float(cp["A_xf_home"]),
+        A_c_home=float(cp["A_c_home"]),
+        A_d_home=float(cp["A_d_home"]),
+        N=float(cp["N"]),
+        D_M_m=float(cp["D_M_m"]),   D_xf_m=float(cp["D_xf_m"]),
+        D_c_m=float(cp["D_c_m"]),   D_d_m=float(cp["D_d_m"]),
+        D_M_f=float(cp["D_M_f"]),   D_xf_f=float(cp["D_xf_f"]),
+        D_c_f=float(cp["D_c_f"]),   D_d_f=float(cp["D_d_f"]),
     )
-    cb = ColorBar(color_mapper=cmap, location=(0, 0), width=10,
-                  ticker=BasicTicker(desired_num_ticks=5))
-    p.add_layout(cb, "right")
-
-    hover = p.select_one(HoverTool)
-    hover.tooltips = [("County", "@name"), ("Value", "@value{0.000}")]
-
-    # cmap_source carries (low, high) so callbacks can update the colour scale
-    return p
 
 
-def participation_rate(LM_f: np.ndarray, h_grid: np.ndarray,
-                       w_ell: float, wage_gap: float, sigma_u: float,
-                       u_bar: float, phi: float) -> float:
-    V_P = phi * w_ell * wage_gap * np.asarray(h_grid)
-    P = 1.0 / (1.0 + np.exp((u_bar - V_P) / max(sigma_u, 1e-9)))
-    return float(np.mean(P))
+def _county_specific_mp(global_p: dict, cp: dict) -> ModelParams:
+    """ModelParams with the county's own D weights baked in."""
+    base = _build_mp(global_p)
+    return ModelParams(
+        eps_engel=base.eps_engel,
+        beta_xf=base.beta_xf, beta_xn=base.beta_xn,
+        beta_c=base.beta_c,   beta_d=base.beta_d,
+        kappa_xf=base.kappa_xf, kappa_xn=base.kappa_xn,
+        kappa_c=base.kappa_c,   kappa_d=base.kappa_d,
+        omega_xf=base.omega_xf, omega_c=base.omega_c, omega_d=base.omega_d,
+        eta_xf=base.eta_xf,     eta_c=base.eta_c,     eta_d=base.eta_d,
+        D_M_m=float(cp["D_M_m"]),
+        D_xf_m=float(cp["D_xf_m"]),
+        D_c_m=float(cp["D_c_m"]),
+        D_d_m=float(cp["D_d_m"]),
+        D_M_f=float(cp["D_M_f"]),
+        D_xf_f=float(cp["D_xf_f"]),
+        D_c_f=float(cp["D_c_f"]),
+        D_d_f=float(cp["D_d_f"]),
+        rho=base.rho, phi=base.phi,
+        sigma_u_m=base.sigma_u_m, sigma_u_f=base.sigma_u_f,
+        u_bar_m=base.u_bar_m,     u_bar_f=base.u_bar_f,
+        wage_gap=base.wage_gap, p_xf=base.p_xf,
+        sigma_mig=base.sigma_mig,
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# ScenarioUI — one column (A or B)
-# ═══════════════════════════════════════════════════════════════════════
+# =========================================================================== #
+# Solve wrappers (return arrays sized to H_GRID)                              #
+# =========================================================================== #
+
+def solve_one_county(global_p: dict, cp: dict) -> dict:
+    """Solve a single county over H_GRID at the (possibly edited) parameters.
+
+    Returns a dict of arrays length len(H_GRID) for plotting, plus
+    convergence diagnostics.
+    """
+    mp = _county_specific_mp(global_p, cp)
+    cid = int(cp.get("county_id", 0))
+    cty = _build_county(cp, cid, mp)
+
+    Nh = len(H_GRID)
+    arrs = {k: np.full(Nh, np.nan) for k in (
+        "LM_m","LM_f","Lxf_m","Lxf_f","Lc_m","Lc_f","Ld_m","Ld_f",
+        "E","V11","V10","V01","V00","EV","P_m","P_f",
+        "th_xf","th_xn","th_c","th_d",
+        "SxfH_share","SxfM_share","ScH_share","ScM_share",
+        "SdH_share","SdM_share",
+        "Pxf","Pc","Pd",
+        "SxfM","ScM","SdM","xn",
+    )}
+    arrs["converged"] = np.zeros(Nh, dtype=bool)
+
+    for i, h in enumerate(H_GRID):
+        try:
+            res = solve_county_household(cty, mp, float(h), float(h), a=0.2)
+        except Exception:
+            continue
+        if not res["conv11"]:
+            continue
+        hh = res["hh11"]
+        arrs["LM_m"][i]=hh.LM_m; arrs["LM_f"][i]=hh.LM_f
+        arrs["Lxf_m"][i]=hh.Lxf_m; arrs["Lxf_f"][i]=hh.Lxf_f
+        arrs["Lc_m"][i]=hh.Lc_m; arrs["Lc_f"][i]=hh.Lc_f
+        arrs["Ld_m"][i]=hh.Ld_m; arrs["Ld_f"][i]=hh.Ld_f
+        arrs["E"][i]=hh.E
+        arrs["th_xf"][i]=hh.th_xf; arrs["th_xn"][i]=hh.th_xn
+        arrs["th_c"][i]=hh.th_c;   arrs["th_d"][i]=hh.th_d
+        arrs["Pxf"][i]=hh.Pxf; arrs["Pc"][i]=hh.Pc; arrs["Pd"][i]=hh.Pd
+        arrs["SxfM"][i]=hh.SxfM; arrs["ScM"][i]=hh.ScM
+        arrs["SdM"][i]=hh.SdM; arrs["xn"][i]=hh.xn
+        # Expenditure shares (sum to 1 by CES envelope)
+        if hh.Pxf > 0 and hh.Sxf > 0:
+            arrs["SxfH_share"][i] = (hh.PxfH * hh.SxfH) / (hh.Pxf * hh.Sxf)
+            arrs["SxfM_share"][i] = (hh.p_xf * hh.SxfM) / (hh.Pxf * hh.Sxf)
+        if hh.Pc > 0 and hh.Sc > 0:
+            arrs["ScH_share"][i] = (hh.PcH * hh.ScH) / (hh.Pc * hh.Sc)
+            arrs["ScM_share"][i] = (hh.pc  * hh.ScM) / (hh.Pc * hh.Sc)
+        if hh.Pd > 0 and hh.Sd > 0:
+            arrs["SdH_share"][i] = (hh.PdH * hh.SdH) / (hh.Pd * hh.Sd)
+            arrs["SdM_share"][i] = (hh.pd  * hh.SdM) / (hh.Pd * hh.Sd)
+        arrs["V11"][i]=res["hh11"].V_state; arrs["V10"][i]=res["hh10"].V_state
+        arrs["V01"][i]=res["hh01"].V_state; arrs["V00"][i]=res["hh00"].V_state
+        arrs["P_m"][i]=res["P_m"]; arrs["P_f"][i]=res["P_f"]; arrs["EV"][i]=res["EV"]
+        arrs["converged"][i] = True
+
+    arrs["n_conv"]   = int(arrs["converged"].sum())
+    arrs["wage_KSh"] = float(cp["w_ell"] * E_SCALE)
+    arrs["N"]        = float(cp["N"])
+    return arrs
+
+
+def solve_all(global_p: dict, counties_p: Dict[int, dict]
+              ) -> Dict[int, dict]:
+    """Solve every county; returns {cid: arrays}."""
+    return {cid: solve_one_county(global_p, counties_p[cid])
+            for cid in sorted(counties_p)}
+
+
+def summarise_spatial(spatial: Dict[int, dict],
+                      counties_p: Dict[int, dict]) -> dict:
+    """National summary metrics from a fully-solved spatial result."""
+    ids = sorted(spatial.keys())
+    Vstar = np.array([float(np.nanmean(spatial[c]["EV"])) for c in ids])
+    GDP   = np.array([float(np.nanmean(spatial[c]["E"]))
+                      * float(spatial[c]["N"]) for c in ids])
+    Pf    = np.array([float(np.nanmean(spatial[c]["P_f"])) for c in ids])
+    Pm    = np.array([float(np.nanmean(spatial[c]["P_m"])) for c in ids])
+    LMm   = np.array([float(np.nanmean(spatial[c]["LM_m"])) for c in ids])
+    LMf   = np.array([float(np.nanmean(spatial[c]["LM_f"])) for c in ids])
+    ratio = LMf / np.maximum(LMm, 1e-9)
+    wages = np.array([spatial[c]["wage_KSh"] for c in ids])
+    Ns    = np.array([float(counties_p[c]["N"]) for c in ids])
+
+    # Sectoral employment from compute_market_clearing-style accounting
+    # We do the same accounting inline using the grid means, mirroring
+    # solver_functions.compute_market_clearing.
+    LM_xf = np.array([float(np.nanmean(spatial[c]["SxfM"]))
+                      * float(counties_p[c]["N"])
+                      / max(float(counties_p[c]["AM_xf"]), 1e-9)
+                      for c in ids])
+    LM_c  = np.array([float(np.nanmean(spatial[c]["ScM"]))
+                      * float(counties_p[c]["N"])
+                      / max(float(counties_p[c]["AM_c"]), 1e-9)
+                      for c in ids])
+    LM_d  = np.array([float(np.nanmean(spatial[c]["SdM"]))
+                      * float(counties_p[c]["N"])
+                      / max(float(counties_p[c]["AM_d"]), 1e-9)
+                      for c in ids])
+    LM_total_supplied = np.array([float(np.nanmean(spatial[c]["LM_m"])
+                                          + np.nanmean(spatial[c]["LM_f"]))
+                                  * float(counties_p[c]["N"])
+                                  for c in ids])
+    LM_xn = LM_total_supplied - (LM_xf + LM_c + LM_d)
+
+    # Population-weighted Ubar; xi_l = Ubar - Vstar_l
+    finite = np.isfinite(Vstar) & (Ns > 0)
+    Ubar = (float(np.average(Vstar[finite], weights=Ns[finite]))
+            if finite.sum() > 0 else float("nan"))
+    xi = Ubar - Vstar
+
+    return dict(counties=ids, Vstar=Vstar, GDP=GDP,
+                Pm=Pm, Pf=Pf, LM_m=LMm, LM_f=LMf, ratio=ratio,
+                wages=wages, xi=xi, Ubar=Ubar,
+                LM_xf=LM_xf, LM_c=LM_c, LM_d=LM_d, LM_xn=LM_xn,
+                N=Ns)
+
+
+# =========================================================================== #
+# UI factory                                                                  #
+# =========================================================================== #
+
+def _empty_per_h() -> dict:
+    return {k: [float("nan")] * len(H_GRID) for k in (
+        "LM_m","LM_f","Lxf_m","Lxf_f","Lc_m","Lc_f","Ld_m","Ld_f",
+        "th_xf","th_xn","th_c","th_d",
+        "SxfH","SxfM","ScH","ScM","SdH","SdM",
+        "P_m","P_f",
+        "gap_M","gap_xf","gap_c","gap_d")} | {"h": list(H_GRID)}
+
+
+def _empty_spatial() -> dict:
+    ids = sorted(BASELINE_COUNTIES.keys())
+    return dict(
+        county=ids,
+        name=[BASELINE_COUNTIES[c]["name"] for c in ids],
+        Vstar=[float("nan")] * len(ids),
+        xi   =[float("nan")] * len(ids),
+        wage =[float("nan")] * len(ids),
+        Pm   =[float("nan")] * len(ids),
+        Pf   =[float("nan")] * len(ids),
+        ratio=[float("nan")] * len(ids),
+        LM_m =[float("nan")] * len(ids),
+        LM_f =[float("nan")] * len(ids),
+        GDP  =[float("nan")] * len(ids),
+        N    =[float("nan")] * len(ids),
+    )
+
+
+def _empty_map_data() -> dict:
+    ids = sorted(BASELINE_COUNTIES.keys())
+    return dict(
+        id=ids,
+        name=[BASELINE_COUNTIES[c]["name"] for c in ids],
+        lat=[BASELINE_COUNTIES[c]["lat"] for c in ids],
+        lon=[BASELINE_COUNTIES[c]["lon"] for c in ids],
+        value=[float(BASELINE_COUNTIES[c]["w_ell"]) * E_SCALE for c in ids],
+    )
+
+
+# =========================================================================== #
+# ScenarioUI — one of two side-by-side scenarios                              #
+# =========================================================================== #
 
 class ScenarioUI:
-    def __init__(self, label: str):
+    """One scenario column. Two of these go side by side."""
+
+    def __init__(self, label: str, default_county: int = 47):
         self.label = label
-        self.selected_county = 47  # Nairobi by default
-        # Working copies of parameters (user can edit)
-        self.global_p = dict(BASELINE["global"])
-        self.counties_p = {k: dict(v) for k, v in BASELINE["counties"].items()}
-        # Cached spatial results for the Spatial / Counterfactual tabs
-        self.spatial_results: Optional[Dict[int, dict]] = None
-        self.cf_results: Optional[Dict[str, Dict[int, dict]]] = None
+        self.selected_county = default_county
 
-        # ── Build widgets ──
-        self.global_inputs: Dict[str, NumericInput] = {}
-        for k, lab in GLOBAL_FIELDS:
-            self.global_inputs[k] = NumericInput(
-                title=lab, value=float(self.global_p[k]), mode="float", width=130)
+        # State (mutable; user edits flow into these)
+        self.global_p   = dict(BASELINE_PARAMS)
+        self.counties_p = {cid: dict(BASELINE_COUNTIES[cid])
+                           for cid in BASELINE_COUNTIES}
+        for cid in self.counties_p:
+            self.counties_p[cid]["county_id"] = cid
 
-        self.county_inputs: Dict[str, NumericInput] = {}
-        cp = self.counties_p[self.selected_county]
-        for k, lab in COUNTY_FIELDS:
-            self.county_inputs[k] = NumericInput(
-                title=lab, value=float(cp[k]), mode="float", width=130)
+        # Cached results
+        self.spatial: Optional[Dict[int, dict]] = None
+        self.spatial_summary: Optional[dict] = None
+        self.cf_results: Dict[str, Dict[int, dict]] = {}
+        self.cf_summaries: Dict[str, dict] = {}
 
+        # Status div
+        self.status = Div(
+            text=f"<i>{label}: ready.</i>",
+            width=W_FIG * 2 + 30, height=30,
+            styles={"font-family":"sans-serif","font-size":"11pt"})
         self.county_label = Div(
-            text=f"<b>Selected county:</b> {COUNTY[self.selected_county]['name']} "
-                 f"(#{self.selected_county})", width=380)
+            text=f"<b>Selected county:</b> "
+                 f"{COUNTY_NAMES[default_county]} (#{default_county})",
+            width=W_FIG * 2 + 30,
+            styles={"font-family":"sans-serif","font-size":"11pt"})
 
-        self.solve_btn = Button(label="Solve selected county",
-                                button_type="primary", width=200)
-        self.reset_btn = Button(label="Reset to baseline",
-                                button_type="default", width=180)
+        # Data sources
+        self.src_hours    = ColumnDataSource(_empty_per_h())
+        self.src_gap      = ColumnDataSource(_empty_per_h())
+        self.src_shares   = ColumnDataSource(_empty_per_h())
+        self.src_homemkt  = ColumnDataSource(_empty_per_h())
+        self.src_part     = ColumnDataSource(_empty_per_h())
+        self.src_spatial  = ColumnDataSource(_empty_spatial())
+        self.src_xi       = ColumnDataSource(dict(rank=[], name=[],
+                                                   xi=[], color=[]))
+        self.src_emp      = ColumnDataSource(dict(name=[], LM_xf=[],
+                                                   LM_xn=[], LM_c=[], LM_d=[]))
+        self.map_source   = ColumnDataSource(_empty_map_data())
+        self.cf_table_src = ColumnDataSource(dict(
+            scenario=[], dGDP=[], dPm=[], dPf=[], dratio=[], dN=[]))
 
-        self.solve_all_btn = Button(label="Solve all 47 counties",
-                                    button_type="success", width=200)
-        self.cf_btn_wage = Button(label="CF: wage_gap = 1",
-                                  button_type="warning", width=180)
-        self.cf_btn_pc = Button(label="CF: p_c × 0.7",
-                                button_type="warning", width=180)
-        self.cf_btn_pd = Button(label="CF: p_d × 0.7",
-                                button_type="warning", width=180)
+        # CF map sources: (scenario × indicator)
+        self.cf_maps = {(sc, ind): ColumnDataSource(_empty_map_data())
+                        for sc in ("wage", "pc", "pd")
+                        for ind in ("dGDP", "dPf", "dratio", "dN")}
 
-        self.status = Div(text="<i>Ready.</i>", width=380)
-
-        # Map data
-        self.map_source = ColumnDataSource(self._initial_map_data())
-        self.cmap_holder = ColumnDataSource(data=dict(low=[-1], high=[1]))
-        self.map_metric = Select(
-            title="Colour map by:",
-            value="wage",
-            options=["wage", "Pf (baseline)", "ΔGDP (last CF)"],
-            width=200,
-        )
-        self.map = make_county_map(
-            self.map_source, self.cmap_holder,
-            title=f"{label} — click a county to select")
-
-        # Per-h plot data sources
-        self.src_hours = ColumnDataSource(
-            dict(h=[], LM_m=[], LM_f=[], Lc_m=[], Lc_f=[], Ld_m=[], Ld_f=[]))
-        self.src_gap = ColumnDataSource(
-            dict(h=[], gap_M=[], gap_c=[], gap_d=[]))
-        self.src_shares = ColumnDataSource(
-            dict(h=[], th_x=[], th_c=[], th_d=[]))
-        self.src_homemkt = ColumnDataSource(
-            dict(h=[], ScH=[], ScM=[], SdH=[], SdM=[]))
-
-        # Spatial summary plot data
-        self.src_spatial = ColumnDataSource(
-            dict(county=[], name=[], Vstar=[], xi=[], wage=[],
-                 Pf=[], ratio=[], LM_m=[], LM_f=[], GDP=[]))
-
-        # Counterfactual results
-        self.cf_table_source = ColumnDataSource(
-            dict(scenario=[], dGDP=[], dPf=[], dratio=[], dN_pct_max=[]))
-        self.cf_map_sources = {
-            (cf, ind): ColumnDataSource(self._initial_map_data())
-            for cf in ("wage", "pc", "pd")
-            for ind in ("dGDP", "dPf", "dratio", "dN_pct")
-        }
-
-        # Build plots and tabs
-        self.plots = self._make_plots()
-        self.tabs = self._make_tabs()
-
-        # Wire callbacks
+        # Build widgets
+        self._build_widgets()
+        self._build_plots()
+        self._build_layout()
         self._wire_callbacks()
 
         # Initial solve to populate the per-h tab
         self._solve_selected_and_update()
 
-    # ── Map data ──
-    def _initial_map_data(self) -> dict:
-        ids = sorted(COUNTY.keys())
-        return dict(
-            id=ids,
-            name=[COUNTY[c]["name"] for c in ids],
-            lat=[COUNTY[c]["lat"] for c in ids],
-            lon=[COUNTY[c]["lon"] for c in ids],
-            value=[float(self.counties_p[c]["w_ell"] * E_SCALE) for c in ids],
-        )
+    # ------------------------------------------------------------------ #
+    # Widgets                                                            #
+    # ------------------------------------------------------------------ #
 
-    def _refresh_map(self) -> None:
-        ids = sorted(COUNTY.keys())
-        metric = self.map_metric.value
-        if metric == "wage":
-            vals = [float(self.counties_p[c]["w_ell"] * E_SCALE) for c in ids]
-            cmap = "RdBu11"; lo = min(vals); hi = max(vals)
-        elif metric == "Pf (baseline)" and self.spatial_results is not None:
-            s = summarise_spatial(self.spatial_results)
-            vals = list(s["Pf"])
-            lo = min(vals); hi = max(vals)
-        elif metric == "ΔGDP (last CF)" and self.cf_results is not None:
-            # Use the most recently run CF
-            last_cf = list(self.cf_results.keys())[-1] if self.cf_results else None
-            if last_cf is None:
-                vals = [0.0] * len(ids); lo = -1; hi = 1
-            else:
-                base = self.spatial_results
-                cf = self.cf_results[last_cf]
-                vals = []
-                for c in ids:
-                    bE = np.nanmean(base[c]["E"]) * base[c]["N_county"]
-                    cE = np.nanmean(cf[c]["E"]) * cf[c]["N_county"]
-                    vals.append(100.0 * (cE / bE - 1.0) if bE > 0 else 0.0)
-                m = max(abs(min(vals)), abs(max(vals))) or 1.0
-                lo, hi = -m, m
-        else:
-            vals = [float(self.counties_p[c]["w_ell"] * E_SCALE) for c in ids]
-            lo, hi = min(vals), max(vals)
+    def _build_widgets(self):
+        # Buttons
+        self.solve_btn     = Button(label="Solve selected county",
+                                     button_type="primary", width=200)
+        self.reset_btn     = Button(label="Reset to baseline", width=140)
+        self.solve_all_btn = Button(label="Solve all 47 counties",
+                                     button_type="success", width=200)
+        self.cf_btn_wage = Button(label="CF: wage_gap = 1",
+                                   button_type="warning", width=180)
+        self.cf_btn_pc   = Button(label="CF: p_c × 0.7",
+                                   button_type="warning", width=180)
+        self.cf_btn_pd   = Button(label="CF: p_d × 0.7",
+                                   button_type="warning", width=180)
+        self.map_metric  = Select(title="Map metric:",
+                                   value="wage",
+                                   options=["wage", "Pf (baseline)",
+                                            "ΔGDP (last CF)"],
+                                   width=200)
+        # Global parameter inputs
+        self.global_inputs = {}
+        for k, lab in GLOBAL_FIELDS:
+            self.global_inputs[k] = NumericInput(
+                title=lab, value=float(self.global_p[k]),
+                mode="float", width=130)
+        # County parameter inputs
+        self.county_inputs = {}
+        for k, lab in COUNTY_FIELDS:
+            self.county_inputs[k] = NumericInput(
+                title=lab,
+                value=float(self.counties_p[self.selected_county][k]),
+                mode="float", width=130)
 
-        self.map_source.data = dict(
-            id=ids,
-            name=[COUNTY[c]["name"] for c in ids],
-            lat=[COUNTY[c]["lat"] for c in ids],
-            lon=[COUNTY[c]["lon"] for c in ids],
-            value=vals,
-        )
-        # Update color mapper range
-        for r in self.map.renderers:
-            try:
-                r.glyph.fill_color["transform"].low = lo
-                r.glyph.fill_color["transform"].high = hi
-            except Exception:
-                pass
+    # ------------------------------------------------------------------ #
+    # Plots                                                              #
+    # ------------------------------------------------------------------ #
 
-    # ── Plots ──
-    def _make_plots(self) -> Dict[str, figure]:
-        H, W = 240, 380
+    def _build_plots(self):
+        # ----- Per-h tab plots ---------------------------------------- #
+        # 1. Hours by gender × activity (8 lines)
+        p_hours = figure(height=H_FIG, width=W_FIG,
+                          title="Hours per week by gender × activity")
+        for col_, color, label in [
+            ("LM_m",  "#1f77b4", "L^M man"),
+            ("LM_f",  "#1f77b4", "L^M woman"),
+            ("Lxf_m", "#ff7f0e", "L^xf man"),
+            ("Lxf_f", "#ff7f0e", "L^xf woman"),
+            ("Lc_m",  "#d62728", "L^c man"),
+            ("Lc_f",  "#d62728", "L^c woman"),
+            ("Ld_m",  "#2ca02c", "L^d man"),
+            ("Ld_f",  "#2ca02c", "L^d woman"),
+        ]:
+            dash = "dashed" if "_f" in col_ else "solid"
+            p_hours.line("h", col_, source=self.src_hours,
+                         color=color, line_dash=dash, line_width=2,
+                         legend_label=label)
+        p_hours.xaxis.axis_label = "h"
+        p_hours.yaxis.axis_label = "hours / week"
+        p_hours.legend.location = "top_left"
+        p_hours.legend.label_text_font_size = "7pt"
 
-        p_h = figure(height=H, width=W, title="Hours by gender × activity")
-        p_h.line("h", "LM_m", source=self.src_hours, color="#1f77b4",
-                 line_width=2, legend_label="L^M man")
-        p_h.line("h", "LM_f", source=self.src_hours, color="#1f77b4",
-                 line_width=2, line_dash="dashed", legend_label="L^M woman")
-        p_h.line("h", "Lc_m", source=self.src_hours, color="#d62728",
-                 line_width=2, legend_label="L^c man")
-        p_h.line("h", "Lc_f", source=self.src_hours, color="#d62728",
-                 line_width=2, line_dash="dashed", legend_label="L^c woman")
-        p_h.line("h", "Ld_m", source=self.src_hours, color="#2ca02c",
-                 line_width=2, legend_label="L^d man")
-        p_h.line("h", "Ld_f", source=self.src_hours, color="#2ca02c",
-                 line_width=2, line_dash="dashed", legend_label="L^d woman")
-        p_h.xaxis.axis_label = "h"; p_h.yaxis.axis_label = "h/wk"
-        p_h.legend.location = "top_left"; p_h.legend.label_text_font_size = "8pt"
+        # 2. Gender gaps (woman - man) for 4 activities
+        p_gap = figure(height=H_FIG, width=W_FIG,
+                        title="Gender gap (woman − man), 4 activities")
+        for col_, color, label in [
+            ("gap_M",  "#1f77b4", "ΔL^M"),
+            ("gap_xf", "#ff7f0e", "ΔL^xf"),
+            ("gap_c",  "#d62728", "ΔL^c"),
+            ("gap_d",  "#2ca02c", "ΔL^d"),
+        ]:
+            p_gap.line("h", col_, source=self.src_gap,
+                       color=color, line_width=2, legend_label=label)
+        p_gap.xaxis.axis_label = "h"
+        p_gap.yaxis.axis_label = "Δ hours / week"
+        p_gap.legend.location = "center_right"
+        p_gap.legend.label_text_font_size = "7pt"
 
-        p_g = figure(height=H, width=W, title="Gender gaps (woman − man)")
-        p_g.line("h", "gap_M", source=self.src_gap, color="#1f77b4",
-                 line_width=2, legend_label="ΔL^M")
-        p_g.line("h", "gap_c", source=self.src_gap, color="#d62728",
-                 line_width=2, legend_label="ΔL^c")
-        p_g.line("h", "gap_d", source=self.src_gap, color="#2ca02c",
-                 line_width=2, legend_label="ΔL^d")
-        p_g.xaxis.axis_label = "h"; p_g.yaxis.axis_label = "Δh/wk"
-        p_g.legend.location = "center_right"; p_g.legend.label_text_font_size = "8pt"
+        # 3. PIGL expenditure shares (4 goods)
+        p_sh = figure(height=H_FIG, width=W_FIG,
+                       title="PIGL expenditure shares (4 goods)")
+        for col_, color, label in [
+            ("th_xf", "#ff7f0e", "θ_xf (food)"),
+            ("th_xn", "#9467bd", "θ_xn (non-food)"),
+            ("th_c",  "#d62728", "θ_c (care)"),
+            ("th_d",  "#2ca02c", "θ_d (domestic)"),
+        ]:
+            p_sh.line("h", col_, source=self.src_shares,
+                      color=color, line_width=2, legend_label=label)
+        p_sh.xaxis.axis_label = "h"
+        p_sh.yaxis.axis_label = "share"
+        p_sh.legend.location = "center_right"
+        p_sh.legend.label_text_font_size = "7pt"
 
-        p_s = figure(height=H, width=W, title="PIGL expenditure shares")
-        p_s.line("h", "th_x", source=self.src_shares, color="#9467bd",
-                 line_width=2, legend_label="θ_x")
-        p_s.line("h", "th_c", source=self.src_shares, color="#d62728",
-                 line_width=2, legend_label="θ_c")
-        p_s.line("h", "th_d", source=self.src_shares, color="#2ca02c",
-                 line_width=2, legend_label="θ_d")
-        p_s.xaxis.axis_label = "h"; p_s.yaxis.axis_label = "share"
-        p_s.legend.location = "center_right"; p_s.legend.label_text_font_size = "8pt"
+        # 4. Home/market expenditure shares (6 lines)
+        p_hm = figure(height=H_FIG, width=W_FIG,
+                       title="Home vs market expenditure shares")
+        for col_, color, dash, label in [
+            ("SxfH", "#ff7f0e", "solid",  "Food home"),
+            ("SxfM", "#ff7f0e", "dashed", "Food market"),
+            ("ScH",  "#d62728", "solid",  "Care home"),
+            ("ScM",  "#d62728", "dashed", "Care market"),
+            ("SdH",  "#2ca02c", "solid",  "Domestic home"),
+            ("SdM",  "#2ca02c", "dashed", "Domestic market"),
+        ]:
+            p_hm.line("h", col_, source=self.src_homemkt,
+                      color=color, line_dash=dash, line_width=2,
+                      legend_label=label)
+        p_hm.xaxis.axis_label = "h"
+        p_hm.yaxis.axis_label = "share of total"
+        p_hm.legend.location = "center_right"
+        p_hm.legend.label_text_font_size = "7pt"
 
-        p_hm = figure(height=H, width=W, title="Home vs market service shares")
-        p_hm.line("h", "ScH", source=self.src_homemkt, color="#d62728",
-                  line_width=2, legend_label="Care home")
-        p_hm.line("h", "ScM", source=self.src_homemkt, color="#d62728",
-                  line_width=2, line_dash="dashed", legend_label="Care market")
-        p_hm.line("h", "SdH", source=self.src_homemkt, color="#2ca02c",
-                  line_width=2, legend_label="Domestic home")
-        p_hm.line("h", "SdM", source=self.src_homemkt, color="#2ca02c",
-                  line_width=2, line_dash="dashed", legend_label="Domestic market")
-        p_hm.xaxis.axis_label = "h"; p_hm.yaxis.axis_label = "share of total"
-        p_hm.legend.location = "center_right"; p_hm.legend.label_text_font_size = "8pt"
+        # 5. Participation rates
+        p_part = figure(height=H_FIG, width=W_FIG,
+                         title="Participation rates P_m, P_f")
+        p_part.line("h", "P_m", source=self.src_part,
+                    color="#1f77b4", line_width=2, legend_label="P_m")
+        p_part.line("h", "P_f", source=self.src_part,
+                    color="#d62728", line_width=2, legend_label="P_f")
+        p_part.xaxis.axis_label = "h"
+        p_part.yaxis.axis_label = "participation"
+        p_part.legend.location = "center_right"
+        p_part.legend.label_text_font_size = "8pt"
 
-        # Spatial summary plots
-        p_vs = figure(height=H, width=W, title="V* vs wage")
-        p_vs.scatter("wage", "Vstar", source=self.src_spatial, size=8,
-                     fill_color="#1f77b4", line_color="black", line_width=0.5)
-        p_vs.xaxis.axis_label = "wage (KSh/hr)"; p_vs.yaxis.axis_label = "V*"
-        h2 = HoverTool(renderers=[p_vs.renderers[0]],
-                       tooltips=[("County", "@name"), ("Wage", "@wage{0}"),
-                                 ("V*", "@Vstar{0.000}")])
-        p_vs.add_tools(h2)
+        self.p_hours, self.p_gap, self.p_sh, self.p_hm, self.p_part = (
+            p_hours, p_gap, p_sh, p_hm, p_part)
 
-        p_xi = figure(height=H, width=W, title="Amenity ξ (sorted)")
-        # We render a vbar after sorting in callback
-        self.src_spatial_sorted = ColumnDataSource(
-            dict(rank=[], name=[], xi=[], color=[]))
-        p_xi.vbar(x="rank", top="xi", width=0.8, source=self.src_spatial_sorted,
+        # ----- Spatial summary plots ---------------------------------- #
+        p_vs = figure(height=H_FIG, width=W_FIG, title="V* vs wage")
+        p_vs.scatter("wage", "Vstar", source=self.src_spatial,
+                     size=8, fill_color="#1f77b4",
+                     line_color="black", line_width=0.5)
+        p_vs.xaxis.axis_label = "wage (KSh/hr)"
+        p_vs.yaxis.axis_label = "V*"
+        p_vs.add_tools(HoverTool(tooltips=[("County","@name"),
+                                            ("Wage","@wage{0}"),
+                                            ("V*","@Vstar{0.000}")]))
+
+        p_xi = figure(height=H_FIG, width=W_FIG,
+                       title="Amenity ξ ranking (highest → lowest)")
+        p_xi.vbar(x="rank", top="xi", width=0.85, source=self.src_xi,
                   fill_color="color", line_color="black", line_width=0.3)
-        p_xi.xaxis.axis_label = "county rank (highest → lowest)"
+        p_xi.xaxis.axis_label = "county rank"
         p_xi.yaxis.axis_label = "ξ"
-        h3 = HoverTool(renderers=[p_xi.renderers[0]],
-                       tooltips=[("County", "@name"), ("ξ", "@xi{0.000}")])
-        p_xi.add_tools(h3)
+        p_xi.add_tools(HoverTool(tooltips=[("County","@name"),
+                                            ("ξ","@xi{0.000}")]))
 
-        p_gap_county = figure(height=H, width=W,
-                              title="Gender market-hours ratio L^M_f / L^M_m")
-        p_gap_county.scatter("wage", "ratio", source=self.src_spatial, size=8,
-                             fill_color="#d62728", line_color="black",
-                             line_width=0.5)
-        p_gap_county.xaxis.axis_label = "wage (KSh/hr)"
-        p_gap_county.yaxis.axis_label = "L^M_f / L^M_m"
-        h4 = HoverTool(renderers=[p_gap_county.renderers[0]],
-                       tooltips=[("County", "@name"),
-                                 ("Ratio", "@ratio{0.000}")])
-        p_gap_county.add_tools(h4)
+        p_ratio = figure(height=H_FIG, width=W_FIG,
+                          title="Female/male market hours ratio")
+        p_ratio.scatter("wage", "ratio", source=self.src_spatial, size=8,
+                        fill_color="#d62728", line_color="black",
+                        line_width=0.5)
+        p_ratio.xaxis.axis_label = "wage (KSh/hr)"
+        p_ratio.yaxis.axis_label = "L^M_f / L^M_m"
+        p_ratio.add_tools(HoverTool(tooltips=[("County","@name"),
+                                               ("Wage","@wage{0}"),
+                                               ("ratio","@ratio{0.000}")]))
 
-        return {
-            "hours": p_h, "gap": p_g, "shares": p_s, "homemkt": p_hm,
-            "Vstar": p_vs, "xi": p_xi, "gap_county": p_gap_county,
-        }
+        p_emp = figure(height=H_FIG, width=W_FIG,
+                        title="Sectoral market employment by county",
+                        x_range=[BASELINE_COUNTIES[c]["name"]
+                                  for c in sorted(BASELINE_COUNTIES)])
+        p_emp.vbar_stack(["LM_xf","LM_xn","LM_c","LM_d"],
+                         x="name", source=self.src_emp,
+                         color=["#ff7f0e","#9467bd","#d62728","#2ca02c"],
+                         legend_label=["food","non-food","care","domestic"],
+                         width=0.8)
+        p_emp.xaxis.major_label_orientation = math.pi / 2.5
+        p_emp.xaxis.major_label_text_font_size = "6pt"
+        p_emp.yaxis.axis_label = "employment (efficiency hours)"
+        p_emp.legend.location = "top_left"
+        p_emp.legend.label_text_font_size = "7pt"
 
-    def _make_tabs(self) -> Tabs:
-        per_h = column(
-            row(self.plots["hours"], self.plots["gap"]),
-            row(self.plots["shares"], self.plots["homemkt"]),
-        )
-        spatial = column(
-            self.solve_all_btn,
-            row(self.plots["Vstar"], self.plots["xi"]),
-            row(self.plots["gap_county"]),
-        )
-        # Counterfactual tab — table + nine maps (3 maps × 3 scenarios)
-        cf_table = DataTable(
-            source=self.cf_table_source,
+        self.p_vs, self.p_xi, self.p_ratio, self.p_emp = (
+            p_vs, p_xi, p_ratio, p_emp)
+
+        # ----- Map ---------------------------------------------------- #
+        self.map_color_mapper = LinearColorMapper(palette=RdBu11,
+                                                    low=0, high=1)
+        p_map = figure(height=300, width=W_FIG,
+                        title=f"{self.label}: click a county",
+                        match_aspect=True, tools="tap,reset,pan,wheel_zoom")
+        p_map.scatter("lon", "lat", source=self.map_source, size=14,
+                      fill_color={"field":"value",
+                                   "transform":self.map_color_mapper},
+                      line_color="black", line_width=0.5)
+        p_map.add_tools(HoverTool(tooltips=[("County","@name"),
+                                              ("Value","@value{0.000}")]))
+        cb = ColorBar(color_mapper=self.map_color_mapper,
+                       ticker=BasicTicker(), location=(0, 0),
+                       label_standoff=4, height=200, width=12)
+        p_map.add_layout(cb, "right")
+        p_map.xaxis.axis_label = "lon"
+        p_map.yaxis.axis_label = "lat"
+        self.p_map = p_map
+
+        # ----- Counterfactual table ----------------------------------- #
+        self.cf_table = DataTable(
+            source=self.cf_table_src, width=W_FIG * 2, height=140,
             columns=[
                 TableColumn(field="scenario", title="Scenario"),
-                TableColumn(field="dGDP", title="ΔGDP (%)",
-                            formatter=NumberFormatter(format="+0.00")),
-                TableColumn(field="dPf", title="ΔP_f (pp)",
-                            formatter=NumberFormatter(format="+0.000")),
-                TableColumn(field="dratio", title="Δratio (pp)",
-                            formatter=NumberFormatter(format="+0.000")),
-                TableColumn(field="dN_pct_max", title="max |ΔN| (%)",
-                            formatter=NumberFormatter(format="0.00")),
-            ],
-            width=820, height=140, index_position=None,
+                TableColumn(field="dGDP", title="ΔGDP %",
+                             formatter=NumberFormatter(format="0.00")),
+                TableColumn(field="dPm",  title="ΔP_m (pp)",
+                             formatter=NumberFormatter(format="0.00")),
+                TableColumn(field="dPf",  title="ΔP_f (pp)",
+                             formatter=NumberFormatter(format="0.00")),
+                TableColumn(field="dratio", title="Δ ratio",
+                             formatter=NumberFormatter(format="0.000")),
+                TableColumn(field="dN",   title="ΔN %",
+                             formatter=NumberFormatter(format="0.00")),
+            ])
+
+        # ----- CF choropleth grid (3 × 4) ----------------------------- #
+        # Per-indicator value format for the tooltip
+        _cf_fmt = {
+            "dGDP":   "{+0.00}%",     # percentage change
+            "dPf":    "{+0.00} pp",   # percentage points
+            "dratio": "{+0.000}",     # change in L^M_f / L^M_m
+            "dN":     "{+0.00}%",     # percentage change in population
+        }
+        self.cf_map_figs = {}
+        for sc, sc_title in [("wage","wage_gap=1"),
+                              ("pc","p_c × 0.7"),
+                              ("pd","p_d × 0.7")]:
+            for ind, ind_title in [("dGDP","ΔGDP%"),
+                                    ("dPf","ΔP_f"),
+                                    ("dratio","Δratio"),
+                                    ("dN","ΔN%")]:
+                src = self.cf_maps[(sc, ind)]
+                cm  = LinearColorMapper(palette=RdBu11, low=-1, high=1)
+                f = figure(height=180, width=200,
+                            title=f"{sc_title}: {ind_title}",
+                            match_aspect=True,
+                            tools="reset,pan,wheel_zoom",
+                            toolbar_location=None)
+                f.scatter("lon", "lat", source=src, size=10,
+                          fill_color={"field":"value","transform":cm},
+                          line_color="black", line_width=0.3)
+                f.add_tools(HoverTool(tooltips=[
+                    ("County", "@name"),
+                    (ind_title, f"@value{_cf_fmt[ind]}"),
+                ]))
+                f.xaxis.visible = False
+                f.yaxis.visible = False
+                self.cf_map_figs[(sc, ind, "fig")] = f
+                self.cf_map_figs[(sc, ind, "cmap")] = cm
+
+    # ------------------------------------------------------------------ #
+    # Layout                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _build_layout(self):
+        # Tab 1: per-h
+        tab1 = TabPanel(child=column(
+            row(self.p_hours, self.p_gap),
+            row(self.p_sh,    self.p_hm),
+            row(self.p_part)
+        ), title="Per-h plots (selected county)")
+
+        # Tab 2: spatial summary
+        tab2 = TabPanel(child=column(
+            row(self.p_vs, self.p_ratio),
+            row(self.p_xi, self.p_emp),
+        ), title="Spatial summary")
+
+        # Tab 3: counterfactuals
+        cf_grid_rows = []
+        for sc in ("wage", "pc", "pd"):
+            row_figs = [self.cf_map_figs[(sc, ind, "fig")]
+                        for ind in ("dGDP","dPf","dratio","dN")]
+            cf_grid_rows.append(row(*row_figs))
+        tab3 = TabPanel(child=column(
+            row(self.cf_btn_wage, self.cf_btn_pc, self.cf_btn_pd),
+            self.cf_table,
+            *cf_grid_rows,
+        ), title="Counterfactuals")
+
+        self.tabs = Tabs(tabs=[tab1, tab2, tab3])
+
+        # Parameter blocks (two-per-row)
+        def two_per_row(inputs_dict, fields):
+            rows = []
+            it = iter(fields)
+            for k1, _ in it:
+                try:
+                    k2, _ = next(it)
+                    rows.append(row(inputs_dict[k1], inputs_dict[k2]))
+                except StopIteration:
+                    rows.append(row(inputs_dict[k1]))
+            return column(*rows)
+
+        global_block = column(
+            Div(text="<b>Global parameters</b>"),
+            two_per_row(self.global_inputs, GLOBAL_FIELDS))
+        county_block = column(
+            Div(text="<b>County parameters</b>"),
+            two_per_row(self.county_inputs, COUNTY_FIELDS))
+
+        controls = column(
+            row(self.solve_btn, self.reset_btn),
+            row(self.solve_all_btn, self.map_metric),
+            self.county_label,
+            global_block,
+            county_block,
         )
-        cf_buttons = row(self.cf_btn_wage, self.cf_btn_pc, self.cf_btn_pd)
-        cf_maps = self._make_cf_maps_grid()
-        cf_panel = column(
-            Div(text="<b>Counterfactual results.</b> Run any of the three "
-                     "scenarios. The table shows national means; the maps show "
-                     "per-county changes. The fourth column of maps shows "
-                     "predicted migration response (ΔN%) under a logit "
-                     "reallocation with σ_mig = 1.0. Requires the spatial "
-                     "baseline to be solved first (Spatial tab).",
-                width=820),
-            cf_buttons, cf_table, cf_maps,
+
+        self.layout = column(
+            Div(text=f"<h2 style='margin:0'>{self.label}</h2>"),
+            self.p_map,
+            controls,
+            self.status,
+            self.tabs,
         )
 
-        return Tabs(tabs=[
-            TabPanel(child=per_h, title="Per-h plots (selected county)"),
-            TabPanel(child=spatial, title="Spatial summary"),
-            TabPanel(child=cf_panel, title="Counterfactuals"),
-        ])
+    # ------------------------------------------------------------------ #
+    # Callbacks                                                          #
+    # ------------------------------------------------------------------ #
 
-    def _make_cf_maps_grid(self):
-        scenarios = [("wage", "Wage gap = 1"),
-                     ("pc", "p_c × 0.7"),
-                     ("pd", "p_d × 0.7")]
-        indicators = [("dGDP", "ΔGDP (%)", "RdBu11"),
-                      ("dPf", "ΔP_f (pp)", "PiYG11"),
-                      ("dratio", "Δratio (pp)", "PuOr11"),
-                      ("dN_pct", "ΔN (% migration)", "RdBu11")]
-        rows_ = []
-        for scen_key, scen_lab in scenarios:
-            map_row = []
-            for ind_key, ind_lab, palette in indicators:
-                src = self.cf_map_sources[(scen_key, ind_key)]
-                p = figure(width=240, height=240,
-                           title=f"{scen_lab} — {ind_lab}",
-                           x_range=(33.2, 42.6), y_range=(-5.2, 5.2),
-                           tools="hover", toolbar_location=None)
-                p.xaxis.visible = False; p.yaxis.visible = False
-                p.xgrid.visible = False; p.ygrid.visible = False
-                p.background_fill_color = "#f0f4f8"
-                p.line([33.7, 42.2, 42.2, 33.7, 33.7],
-                       [-4.8, -4.8, 4.5, 4.5, -4.8],
-                       color="#888", line_dash="dotted", line_width=1)
-                pal = {"RdBu11": RdBu11, "PiYG11": PiYG11,
-                       "PuOr11": PuOr11}[palette]
-                cmap = LinearColorMapper(palette=pal, low=-1, high=1)
-                p.scatter(x="lon", y="lat", source=src, size=8,
-                          fill_color={"field": "value", "transform": cmap},
-                          line_color="black", line_width=0.4)
-                hover = p.select_one(HoverTool)
-                hover.tooltips = [("County", "@name"),
-                                  ("Value", "@value{+0.00}")]
-                map_row.append(p)
-            rows_.append(row(*map_row))
-        return column(*rows_)
-
-    # ── Callbacks ──
-    def _wire_callbacks(self) -> None:
-        # County selection via tap on the map
-        def on_tap(event):
-            if not self.map_source.selected.indices:
+    def _wire_callbacks(self):
+        def on_tap(*_):
+            sel = self.map_source.selected.indices
+            if not sel:
                 return
-            idx = self.map_source.selected.indices[0]
+            idx  = sel[0]
             cnum = self.map_source.data["id"][idx]
             self._select_county(int(cnum))
-
-        self.map_source.selected.on_change("indices", lambda attr, old, new:
-                                            on_tap(None))
+        self.map_source.selected.on_change(
+            "indices", lambda attr, old, new: on_tap())
 
         self.solve_btn.on_click(self._solve_selected_and_update)
         self.reset_btn.on_click(self._reset)
@@ -709,265 +817,328 @@ class ScenarioUI:
         self.cf_btn_wage.on_click(lambda: self._run_cf("wage"))
         self.cf_btn_pc.on_click(lambda: self._run_cf("pc"))
         self.cf_btn_pd.on_click(lambda: self._run_cf("pd"))
-        self.map_metric.on_change("value", lambda attr, old, new:
-                                   self._refresh_map())
+        self.map_metric.on_change("value",
+                                   lambda attr, old, new: self._refresh_map())
 
-    def _select_county(self, cnum: int) -> None:
-        # Save the current county_inputs back before switching
+    def _select_county(self, cnum: int):
+        # Save the current county_inputs before switching
         self._sync_inputs_to_county(self.selected_county)
         self.selected_county = cnum
         cp = self.counties_p[cnum]
         for k, _ in COUNTY_FIELDS:
             self.county_inputs[k].value = float(cp[k])
         self.county_label.text = (
-            f"<b>Selected county:</b> {COUNTY[cnum]['name']} (#{cnum})")
+            f"<b>Selected county:</b> {COUNTY_NAMES[cnum]} (#{cnum})")
         self._solve_selected_and_update()
 
-    def _sync_inputs_to_state(self) -> None:
-        """Read all input widgets back into self.global_p and self.counties_p."""
+    def _sync_inputs_to_state(self):
         for k, _ in GLOBAL_FIELDS:
             v = self.global_inputs[k].value
             if v is not None:
                 self.global_p[k] = float(v)
         self._sync_inputs_to_county(self.selected_county)
 
-    def _sync_inputs_to_county(self, cnum: int) -> None:
+    def _sync_inputs_to_county(self, cnum: int):
         for k, _ in COUNTY_FIELDS:
             v = self.county_inputs[k].value
             if v is not None:
                 self.counties_p[cnum][k] = float(v)
 
-    def _solve_selected_and_update(self) -> None:
+    def _solve_selected_and_update(self):
         self._sync_inputs_to_state()
-        self.status.text = "<i>Solving selected county…</i>"
+        self.status.text = (f"<i>{self.label}: solving "
+                             f"{COUNTY_NAMES[self.selected_county]} ...</i>")
         try:
-            r = solve_county(self.global_p,
-                             self.counties_p[self.selected_county])
+            r = solve_one_county(self.global_p,
+                                  self.counties_p[self.selected_county])
+            # Hours
             self.src_hours.data = dict(
-                h=H_GRID, LM_m=r["LM_m"], LM_f=r["LM_f"],
-                Lc_m=r["Lc_m"], Lc_f=r["Lc_f"],
-                Ld_m=r["Ld_m"], Ld_f=r["Ld_f"])
+                h=list(H_GRID),
+                LM_m=list(r["LM_m"]), LM_f=list(r["LM_f"]),
+                Lxf_m=list(r["Lxf_m"]), Lxf_f=list(r["Lxf_f"]),
+                Lc_m=list(r["Lc_m"]), Lc_f=list(r["Lc_f"]),
+                Ld_m=list(r["Ld_m"]), Ld_f=list(r["Ld_f"]))
+            # Gaps (woman − man)
             self.src_gap.data = dict(
-                h=H_GRID,
-                gap_M=r["LM_f"] - r["LM_m"],
-                gap_c=r["Lc_f"] - r["Lc_m"],
-                gap_d=r["Ld_f"] - r["Ld_m"])
+                h=list(H_GRID),
+                gap_M =list(r["LM_f"]  - r["LM_m"]),
+                gap_xf=list(r["Lxf_f"] - r["Lxf_m"]),
+                gap_c =list(r["Lc_f"]  - r["Lc_m"]),
+                gap_d =list(r["Ld_f"]  - r["Ld_m"]))
+            # Shares
             self.src_shares.data = dict(
-                h=H_GRID, th_x=r["th_x"], th_c=r["th_c"], th_d=r["th_d"])
+                h=list(H_GRID),
+                th_xf=list(r["th_xf"]), th_xn=list(r["th_xn"]),
+                th_c =list(r["th_c"]),  th_d =list(r["th_d"]))
+            # Home/market
             self.src_homemkt.data = dict(
-                h=H_GRID,
-                ScH=r["ScH_share"], ScM=r["ScM_share"],
-                SdH=r["SdH_share"], SdM=r["SdM_share"])
-            self.status.text = (
-                f"<b>{COUNTY[self.selected_county]['name']}</b> solved · "
-                f"convergence {r['n_conv']}/4 · "
-                f"L^M ratio (m/f) = {np.nanmean(r['LM_m'])/max(np.nanmean(r['LM_f']),1e-9):.2f}")
-        except Exception as e:
-            self.status.text = f"<b style='color:#b00'>Error:</b> {e!r}"
+                h=list(H_GRID),
+                SxfH=list(r["SxfH_share"]), SxfM=list(r["SxfM_share"]),
+                ScH =list(r["ScH_share"]),  ScM =list(r["ScM_share"]),
+                SdH =list(r["SdH_share"]),  SdM =list(r["SdM_share"]))
+            # Participation
+            self.src_part.data = dict(
+                h=list(H_GRID),
+                P_m=list(r["P_m"]), P_f=list(r["P_f"]))
 
-    def _reset(self) -> None:
-        self.global_p = dict(BASELINE["global"])
-        self.counties_p = {k: dict(v) for k, v in BASELINE["counties"].items()}
+            self.status.text = (
+                f"<b>{self.label}: {COUNTY_NAMES[self.selected_county]}</b> "
+                f"solved · convergence {r['n_conv']}/4 · "
+                f"L^M ratio (m/f) = "
+                f"{np.nanmean(r['LM_m'])/max(np.nanmean(r['LM_f']),1e-9):.2f}")
+        except Exception as e:
+            self.status.text = (f"<b style='color:#b00'>"
+                                 f"{self.label}: error</b>: {e!r}")
+
+    def _solve_all_and_update(self):
+        self._sync_inputs_to_state()
+        self.status.text = (f"<i>{self.label}: solving all 47 counties "
+                             f"(this can take 20-40s) ...</i>")
+        try:
+            self.spatial = solve_all(self.global_p, self.counties_p)
+            self.spatial_summary = summarise_spatial(
+                self.spatial, self.counties_p)
+            s = self.spatial_summary
+            ids = s["counties"]
+
+            self.src_spatial.data = dict(
+                county=ids,
+                name=[COUNTY_NAMES[c] for c in ids],
+                Vstar=list(s["Vstar"]), xi=list(s["xi"]),
+                wage =list(s["wages"]),
+                Pm   =list(s["Pm"]),    Pf =list(s["Pf"]),
+                ratio=list(s["ratio"]),
+                LM_m =list(s["LM_m"]),  LM_f=list(s["LM_f"]),
+                GDP  =list(s["GDP"]),   N=list(s["N"]),
+            )
+
+            order = np.argsort(s["xi"])[::-1]
+            cols = ["#1a9850" if x > 0 else "#d73027"
+                    for x in s["xi"][order]]
+            self.src_xi.data = dict(
+                rank=list(range(len(order))),
+                name=[COUNTY_NAMES[ids[i]] for i in order],
+                xi=list(s["xi"][order]),
+                color=cols,
+            )
+            # Sectoral employment, by name (order of vbar_stack x_range)
+            name_order = [COUNTY_NAMES[c] for c in sorted(BASELINE_COUNTIES)]
+            self.src_emp.data = dict(
+                name=name_order,
+                LM_xf=list(s["LM_xf"]),
+                LM_xn=list(s["LM_xn"]),
+                LM_c =list(s["LM_c"]),
+                LM_d =list(s["LM_d"]),
+            )
+            self._refresh_map()
+            self.status.text = (
+                f"<b>{self.label}: 47 counties solved</b> · "
+                f"Ū = {s['Ubar']:.3f} · "
+                f"V* range [{np.nanmin(s['Vstar']):.3f}, "
+                f"{np.nanmax(s['Vstar']):.3f}]")
+        except Exception as e:
+            self.status.text = (f"<b style='color:#b00'>"
+                                 f"{self.label}: solve-all error</b>: {e!r}")
+
+    def _reset(self):
+        self.global_p   = dict(BASELINE_PARAMS)
+        self.counties_p = {cid: dict(BASELINE_COUNTIES[cid])
+                           for cid in BASELINE_COUNTIES}
+        for cid in self.counties_p:
+            self.counties_p[cid]["county_id"] = cid
         for k, _ in GLOBAL_FIELDS:
             self.global_inputs[k].value = float(self.global_p[k])
         cp = self.counties_p[self.selected_county]
         for k, _ in COUNTY_FIELDS:
             self.county_inputs[k].value = float(cp[k])
-        self.spatial_results = None
-        self.cf_results = None
+        self.spatial = None
+        self.spatial_summary = None
+        self.cf_results = {}
+        self.cf_summaries = {}
+        self.cf_table_src.data = dict(
+            scenario=[], dGDP=[], dPm=[], dPf=[], dratio=[], dN=[])
+        for src in self.cf_maps.values():
+            src.data = _empty_map_data()
         self._refresh_map()
         self._solve_selected_and_update()
-        self.status.text = "<i>Reset to baseline.</i>"
+        self.status.text = f"<i>{self.label}: reset to baseline.</i>"
 
-    def _solve_all_and_update(self) -> None:
-        self._sync_inputs_to_state()
-        self.status.text = "<i>Solving all 47 counties…</i>"
-        try:
-            self.spatial_results = solve_all_counties(self.global_p,
-                                                      self.counties_p)
-            s = summarise_spatial(self.spatial_results)
-            ids = s["counties"]
-            self.src_spatial.data = dict(
-                county=ids,
-                name=[COUNTY[c]["name"] for c in ids],
-                Vstar=list(s["Vstar"]), xi=list(s["xi"]),
-                wage=list(s["wages"]), Pf=list(s["Pf"]),
-                ratio=list(s["ratio"]), LM_m=list(s["LM_m"]),
-                LM_f=list(s["LM_f"]), GDP=list(s["GDP"]),
-            )
-            order = np.argsort(s["xi"])[::-1]
-            cols = ["#1a9850" if x > 0 else "#d73027" for x in s["xi"][order]]
-            self.src_spatial_sorted.data = dict(
-                rank=list(range(len(order))),
-                name=[COUNTY[ids[i]]["name"] for i in order],
-                xi=list(s["xi"][order]),
-                color=cols,
-            )
-            self._refresh_map()
+    def _refresh_map(self):
+        ids = sorted(BASELINE_COUNTIES.keys())
+        metric = self.map_metric.value
+        if metric == "wage":
+            vals = [float(self.counties_p[c]["w_ell"]) * E_SCALE
+                    for c in ids]
+            lo, hi = min(vals), max(vals)
+        elif metric == "Pf (baseline)" and self.spatial_summary is not None:
+            s = self.spatial_summary
+            vals = list(s["Pf"])
+            finite = [v for v in vals if np.isfinite(v)]
+            lo, hi = (min(finite), max(finite)) if finite else (0, 1)
+        elif metric == "ΔGDP (last CF)" and self.cf_summaries:
+            last = list(self.cf_summaries.keys())[-1]
+            base_gdp = self.spatial_summary["GDP"]
+            new_gdp  = self.cf_summaries[last]["GDP"]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                vals = list(100.0 * (new_gdp / base_gdp - 1.0))
+            finite = [v for v in vals if np.isfinite(v)]
+            if finite:
+                m = max(abs(min(finite)), abs(max(finite))) or 1.0
+                lo, hi = -m, m
+            else:
+                lo, hi = -1, 1
+        else:
+            vals = [float(self.counties_p[c]["w_ell"]) * E_SCALE
+                    for c in ids]
+            lo, hi = min(vals), max(vals)
+        self.map_source.data = dict(
+            id=ids,
+            name=[COUNTY_NAMES[c] for c in ids],
+            lat =[BASELINE_COUNTIES[c]["lat"] for c in ids],
+            lon =[BASELINE_COUNTIES[c]["lon"] for c in ids],
+            value=vals,
+        )
+        self.map_color_mapper.low  = lo
+        self.map_color_mapper.high = hi
+
+    # ------------------------------------------------------------------ #
+    # Counterfactuals                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _run_cf(self, kind: str):
+        if self.spatial is None:
             self.status.text = (
-                f"All 47 counties solved. Ū = {s['Ubar']:.3f}, "
-                f"V* range [{s['Vstar'].min():.3f}, {s['Vstar'].max():.3f}]")
-        except Exception as e:
-            self.status.text = f"<b style='color:#b00'>Error:</b> {e!r}"
-
-    def _run_cf(self, kind: str) -> None:
-        if self.spatial_results is None:
-            self.status.text = ("<b style='color:#b00'>Run \"Solve all 47\" "
-                                "first (Spatial tab).</b>")
+                f"<b style='color:#b00'>{self.label}: run "
+                f"\"Solve all 47\" first.</b>")
             return
         self._sync_inputs_to_state()
-        # Build counterfactual params
         cf_global = dict(self.global_p)
-        cf_counties = {k: dict(v) for k, v in self.counties_p.items()}
+        cf_counties = {c: dict(p) for c, p in self.counties_p.items()}
         if kind == "wage":
             cf_global["wage_gap"] = 1.0
-            scen_label = "Wage gap = 1"
+            scen_label = "wage_gap = 1"
         elif kind == "pc":
             for c in cf_counties:
                 cf_counties[c]["pc"] *= 0.7
+                cf_counties[c]["AM_c"] = (cf_counties[c]["w_ell"]
+                                            / max(cf_counties[c]["pc"], 1e-9))
             scen_label = "p_c × 0.7"
         elif kind == "pd":
             for c in cf_counties:
                 cf_counties[c]["pd"] *= 0.7
+                cf_counties[c]["AM_d"] = (cf_counties[c]["w_ell"]
+                                            / max(cf_counties[c]["pd"], 1e-9))
             scen_label = "p_d × 0.7"
         else:
             return
 
-        self.status.text = f"<i>Running counterfactual: {scen_label}…</i>"
+        self.status.text = (f"<i>{self.label}: running CF "
+                             f"\"{scen_label}\" ...</i>")
         try:
-            cf_res = solve_all_counties(cf_global, cf_counties)
-            if self.cf_results is None:
-                self.cf_results = {}
-            self.cf_results[kind] = cf_res
-            # Compute deltas and update table + maps
+            spatial_cf = solve_all(cf_global, cf_counties)
+            summary_cf = summarise_spatial(spatial_cf, cf_counties)
+
+            # Migration: population reallocates by logit on V* + xi
+            # (population-weighted variant; see solver_functions.migration_update).
+            # We use baseline xi (not re-calibrated) so the counterfactual
+            # picks up only the structural change, not the amenity reset.
+            from solver_functions import migration_update
+            base = self.spatial_summary
+            ids  = base["counties"]
+            N0   = np.array([float(self.counties_p[c]["N"]) for c in ids])
+            xi   = base["xi"]
+            sigma_mig = float(cf_global.get("sigma_mig", 1.0))
+            N_new = migration_update(N0, summary_cf["Vstar"], xi, sigma_mig)
+            # Inject the migration-updated populations into the summary
+            summary_cf = dict(summary_cf)
+            summary_cf["N"]   = N_new
+            summary_cf["GDP"] = (summary_cf["GDP"] / np.maximum(N0, 1e-9)) * N_new
+
+            self.cf_results[kind]   = spatial_cf
+            self.cf_summaries[kind] = summary_cf
             self._update_cf_outputs()
-            self.status.text = f"<b>Counterfactual {scen_label} done.</b>"
+            self._refresh_map()
+            self.status.text = (f"<b>{self.label}: CF \"{scen_label}\" "
+                                 f"done.</b>")
         except Exception as e:
-            self.status.text = f"<b style='color:#b00'>CF error:</b> {e!r}"
+            self.status.text = (f"<b style='color:#b00'>"
+                                 f"{self.label}: CF error</b>: {e!r}")
 
-    def _update_cf_outputs(self) -> None:
-        base = self.spatial_results
-        ids = sorted(COUNTY.keys())
-        rows_table = []
-        scen_labels = {"wage": "Wage gap = 1",
-                       "pc": "p_c × 0.7", "pd": "p_d × 0.7"}
-
-        # Precompute baseline amenities xi_l (same for all CFs)
-        # using the population-weighted mean utility convention.
-        Ns_base    = np.array([base[c]["N_county"] for c in ids])
-        Vstar_base = np.array([float(np.nanmean(base[c]["V"])) for c in ids])
-        Ubar_base  = float(np.average(Vstar_base, weights=Ns_base))
-        xi_arr     = Ubar_base - Vstar_base
-
-        # Migration response: logit reallocation.
-        # sigma_mig is uncalibrated; 1.0 is the same value as in spatial.py.
-        sigma_mig = 1.0
-
-        for kind, lab in scen_labels.items():
-            if kind not in self.cf_results:
+    def _update_cf_outputs(self):
+        base = self.spatial_summary
+        if base is None:
+            return
+        ids = base["counties"]
+        rows = []
+        for kind, sc_label in [("wage","wage_gap=1"),
+                                ("pc","p_c×0.7"),
+                                ("pd","p_d×0.7")]:
+            if kind not in self.cf_summaries:
                 continue
-            cf = self.cf_results[kind]
-            # Per-county deltas
-            dGDP = []; dPf = []; dratio = []
-            for c in ids:
-                bE = np.nanmean(base[c]["E"]) * base[c]["N_county"]
-                cE = np.nanmean(cf[c]["E"]) * cf[c]["N_county"]
-                dGDP.append(100.0 * (cE / bE - 1.0) if bE > 0 else 0.0)
-                bPf = float(np.nanmean(base[c]["Pf"]))
-                cPf = float(np.nanmean(cf[c]["Pf"]))
-                dPf.append(100.0 * (cPf - bPf))
-                bLm = np.nanmean(base[c]["LM_m"]); bLf = np.nanmean(base[c]["LM_f"])
-                cLm = np.nanmean(cf[c]["LM_m"]);   cLf = np.nanmean(cf[c]["LM_f"])
-                br = bLf / max(bLm, 1e-9); cr = cLf / max(cLm, 1e-9)
-                dratio.append(100.0 * (cr - br))
-
-            # Migration: logit reallocation given new V*_l + xi_l.
-            # N'_l proportional to N_l * exp((V*'_l + xi_l - Ubar') / sigma_mig).
-            # The N_l factor is essential: at baseline (V*'_l = V*_l), all w_l=1
-            # so N'_l = N_l (no migration). Without it, the baseline would predict
-            # uniform population.
-            Vstar_new = np.array([float(np.nanmean(cf[c]["V"])) for c in ids])
-            Ubar_new  = float(np.average(Vstar_new + xi_arr, weights=Ns_base))
-            log_w = (Vstar_new + xi_arr - Ubar_new) / max(sigma_mig, 1e-9)
-            log_w -= log_w.max()           # numerical stability
-            w = Ns_base * np.exp(log_w)
-            N_new = float(np.sum(Ns_base)) * w / float(np.sum(w))
-            dN_pct = list(100.0 * (N_new / Ns_base - 1.0))
-
-            # Update map sources
-            for ind_key, vals in [("dGDP", dGDP), ("dPf", dPf),
-                                  ("dratio", dratio), ("dN_pct", dN_pct)]:
-                src = self.cf_map_sources[(kind, ind_key)]
+            cf = self.cf_summaries[kind]
+            # National (population-weighted) deltas
+            Ns = base["N"]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                dGDP_pct = 100.0 * (cf["GDP"] / base["GDP"] - 1.0)
+                dN_pct   = 100.0 * (cf["N"]   / base["N"]   - 1.0)
+            dPm = (cf["Pm"]   - base["Pm"])    * 100.0   # percentage points
+            dPf = (cf["Pf"]   - base["Pf"])    * 100.0
+            dratio = cf["ratio"] - base["ratio"]
+            wgt = Ns / max(Ns.sum(), 1e-9)
+            rows.append(dict(
+                scenario=sc_label,
+                dGDP=float(np.nansum(dGDP_pct * wgt)),
+                dPm =float(np.nansum(dPm    * wgt)),
+                dPf =float(np.nansum(dPf    * wgt)),
+                dratio=float(np.nansum(dratio * wgt)),
+                dN  =float(np.nansum(dN_pct * wgt)),
+            ))
+            # Update the per-county choropleth maps for this scenario
+            for ind, vec in [("dGDP", dGDP_pct),
+                              ("dPf",  dPf),
+                              ("dratio", dratio),
+                              ("dN",   dN_pct)]:
+                src = self.cf_maps[(kind, ind)]
                 src.data = dict(
                     id=ids,
-                    name=[COUNTY[c]["name"] for c in ids],
-                    lat=[COUNTY[c]["lat"] for c in ids],
-                    lon=[COUNTY[c]["lon"] for c in ids],
-                    value=list(vals),
+                    name=[COUNTY_NAMES[c] for c in ids],
+                    lat=[BASELINE_COUNTIES[c]["lat"] for c in ids],
+                    lon=[BASELINE_COUNTIES[c]["lon"] for c in ids],
+                    value=list(vec),
                 )
+                cm = self.cf_map_figs[(kind, ind, "cmap")]
+                finite = vec[np.isfinite(vec)]
+                if finite.size:
+                    m = max(abs(np.nanmin(finite)),
+                             abs(np.nanmax(finite))) or 1.0
+                    cm.low, cm.high = -m, m
 
-            rows_table.append(dict(
-                scenario=lab,
-                dGDP=float(np.mean(dGDP)),
-                dPf=float(np.mean(dPf)),
-                dratio=float(np.mean(dratio)),
-                dN_pct_max=float(np.max(np.abs(dN_pct))),
-            ))
-        # Update table source
-        if rows_table:
-            self.cf_table_source.data = dict(
-                scenario=[r["scenario"] for r in rows_table],
-                dGDP=[r["dGDP"] for r in rows_table],
-                dPf=[r["dPf"] for r in rows_table],
-                dratio=[r["dratio"] for r in rows_table],
-                dN_pct_max=[r["dN_pct_max"] for r in rows_table],
+        if rows:
+            self.cf_table_src.data = dict(
+                scenario=[r["scenario"] for r in rows],
+                dGDP=[r["dGDP"] for r in rows],
+                dPm =[r["dPm"]  for r in rows],
+                dPf =[r["dPf"]  for r in rows],
+                dratio=[r["dratio"] for r in rows],
+                dN  =[r["dN"]   for r in rows],
             )
 
-    # ── Top-level layout ──
-    def root_layout(self):
-        # Two-column controls: globals on the left of the column,
-        # county-specific on the right
-        global_grid = column(
-            Div(text="<details open><summary><b>Global parameters</b> "
-                     "(click to collapse)</summary>", width=380),
-            *[row(*[self.global_inputs[k] for k, _ in GLOBAL_FIELDS[i:i+2]])
-              for i in range(0, len(GLOBAL_FIELDS), 2)],
-            Div(text="</details>", width=380),
-            width=380,
-        )
-        county_grid = column(
-            self.county_label,
-            Div(text="<details open><summary><b>County-specific parameters</b>"
-                     "</summary>", width=380),
-            *[row(*[self.county_inputs[k] for k, _ in COUNTY_FIELDS[i:i+2]])
-              for i in range(0, len(COUNTY_FIELDS), 2)],
-            Div(text="</details>", width=380),
-            width=380,
-        )
-        controls = column(
-            Div(text=f"<h2 style='margin:0'>{self.label}</h2>", width=400),
-            self.map_metric, self.map,
-            row(self.solve_btn, self.reset_btn),
-            self.status,
-            global_grid, county_grid,
-            width=420,
-        )
-        return row(controls, self.tabs)
 
+# =========================================================================== #
+# Document                                                                    #
+# =========================================================================== #
 
-# ═══════════════════════════════════════════════════════════════════════
-# Build the page
-# ═══════════════════════════════════════════════════════════════════════
+ui_A = ScenarioUI("Scenario A")
+ui_B = ScenarioUI("Scenario B")
 
-scenA = ScenarioUI("Scenario A")
-scenB = ScenarioUI("Scenario B")
+doc_title = Div(
+    text=("<h1 style='margin:4px 0'>Kenya Time-Use Model — 4-good "
+           "spatial equilibrium</h1>"
+           "<p style='margin:0'>Edit parameters, click Solve, "
+           "compare scenarios.</p>"))
 
-page = row(
-    scenA.root_layout(),
-    Spacer(width=24),
-    scenB.root_layout(),
-    sizing_mode="stretch_width",
-)
-
-curdoc().add_root(page)
-curdoc().title = "Kenya Time-Use Model — Spatial Bokeh App"
+curdoc().add_root(column(
+    doc_title,
+    row(ui_A.layout, Spacer(width=20), ui_B.layout),
+))
+curdoc().title = "Kenya Time-Use Model"
