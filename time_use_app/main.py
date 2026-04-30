@@ -60,6 +60,7 @@ from solver_functions import (
 
 PARAMS_PATH = HERE / "calibrated_params.json"
 COUNTY_PATH = HERE / "county_data.csv"
+GEOMETRY_PATH = HERE / "kenya_counties.json"
 
 E_SCALE = 1000.0          # KSh -> 1000-KSh
 H_GRID  = np.array([0.5, 1.0, 2.0, 3.0])
@@ -67,6 +68,39 @@ H_GRID  = np.array([0.5, 1.0, 2.0, 3.0])
 # Plot dims
 H_FIG = 230
 W_FIG = 380
+
+
+# =========================================================================== #
+# County geometry                                                             #
+# =========================================================================== #
+# kenya_counties.json (built from GADM 4.1 level-1, simplified to 0.01°)
+# stores per-county lists of polygon patches (one or more, for islands etc.).
+# Bokeh's `patches` glyph wants one row per patch; we keep the county_id as
+# a column on every row so a single tap-select still gives us the county.
+
+def _load_county_geometry():
+    if not GEOMETRY_PATH.exists():
+        return None
+    with GEOMETRY_PATH.open() as f:
+        raw = json.load(f)
+    # Build flat per-patch lists keyed back to county_id.
+    patches_xs   = []
+    patches_ys   = []
+    patches_id   = []
+    patches_name = []
+    for cid_str in sorted(raw.keys(), key=int):
+        cid = int(cid_str)
+        entry = raw[cid_str]
+        for patch in entry["patches"]:
+            patches_xs.append(patch["xs"])
+            patches_ys.append(patch["ys"])
+            patches_id.append(cid)
+            patches_name.append(entry["name"])
+    return dict(xs=patches_xs, ys=patches_ys,
+                id=patches_id, name=patches_name)
+
+
+COUNTY_GEOMETRY = _load_county_geometry()
 
 
 # =========================================================================== #
@@ -404,6 +438,22 @@ def _empty_spatial() -> dict:
 
 
 def _empty_map_data() -> dict:
+    """Initial column data for the map source.
+
+    If COUNTY_GEOMETRY is loaded, the source is patches-shaped: one row per
+    polygon patch, with `xs`, `ys`, `id`, `name`, `value`.  If the geometry
+    file is missing, fall back to centroids (one row per county).
+    """
+    if COUNTY_GEOMETRY is not None:
+        n = len(COUNTY_GEOMETRY["id"])
+        return dict(
+            xs   = list(COUNTY_GEOMETRY["xs"]),
+            ys   = list(COUNTY_GEOMETRY["ys"]),
+            id   = list(COUNTY_GEOMETRY["id"]),
+            name = list(COUNTY_GEOMETRY["name"]),
+            value= [float("nan")] * n,
+        )
+    # Centroid fallback (matches the pre-geometry behaviour)
     ids = sorted(BASELINE_COUNTIES.keys())
     return dict(
         id=ids,
@@ -663,10 +713,21 @@ class ScenarioUI:
         p_map = figure(height=300, width=W_FIG,
                         title=f"{self.label}: click a county",
                         match_aspect=True, tools="tap,reset,pan,wheel_zoom")
-        p_map.scatter("lon", "lat", source=self.map_source, size=14,
-                      fill_color={"field":"value",
-                                   "transform":self.map_color_mapper},
-                      line_color="black", line_width=0.5)
+        if COUNTY_GEOMETRY is not None:
+            p_map.patches(xs="xs", ys="ys", source=self.map_source,
+                          fill_color={"field":"value",
+                                       "transform":self.map_color_mapper},
+                          line_color="#444", line_width=0.5,
+                          # Make selected/non-selected appearance distinct
+                          selection_line_color="black",
+                          selection_line_width=2.0,
+                          nonselection_fill_alpha=1.0,
+                          nonselection_line_alpha=1.0)
+        else:
+            p_map.scatter("lon", "lat", source=self.map_source, size=14,
+                          fill_color={"field":"value",
+                                       "transform":self.map_color_mapper},
+                          line_color="black", line_width=0.5)
         p_map.add_tools(HoverTool(tooltips=[("County","@name"),
                                               ("Value","@value{0.000}")]))
         cb = ColorBar(color_mapper=self.map_color_mapper,
@@ -712,18 +773,37 @@ class ScenarioUI:
                                     ("dN","ΔN%")]:
                 src = self.cf_maps[(sc, ind)]
                 cm  = LinearColorMapper(palette=RdBu11, low=-1, high=1)
-                f = figure(height=180, width=200,
+                # Slightly wider (235 vs 200) to make room for the colorbar
+                # without squashing the map.
+                f = figure(height=180, width=235,
                             title=f"{sc_title}: {ind_title}",
                             match_aspect=True,
-                            tools="reset,pan,wheel_zoom",
-                            toolbar_location=None)
-                f.scatter("lon", "lat", source=src, size=10,
-                          fill_color={"field":"value","transform":cm},
-                          line_color="black", line_width=0.3)
+                            tools="pan,wheel_zoom,zoom_in,zoom_out,reset",
+                            toolbar_location="right")
+                f.toolbar.logo = None
+                f.toolbar.autohide = False
+                if COUNTY_GEOMETRY is not None:
+                    f.patches(xs="xs", ys="ys", source=src,
+                              fill_color={"field":"value",
+                                           "transform":cm},
+                              line_color="#444", line_width=0.3)
+                else:
+                    f.scatter("lon", "lat", source=src, size=10,
+                              fill_color={"field":"value",
+                                           "transform":cm},
+                              line_color="black", line_width=0.3)
                 f.add_tools(HoverTool(tooltips=[
                     ("County", "@name"),
                     (ind_title, f"@value{_cf_fmt[ind]}"),
                 ]))
+                # Colorbar on the right.  Compact: 8 px wide, no title
+                # (the figure title already names the indicator).
+                cf_cb = ColorBar(color_mapper=cm,
+                                 ticker=BasicTicker(desired_num_ticks=4),
+                                 location=(0, 0), label_standoff=4,
+                                 height=130, width=8,
+                                 major_label_text_font_size="7pt")
+                f.add_layout(cf_cb, "right")
                 f.xaxis.visible = False
                 f.yaxis.visible = False
                 self.cf_map_figs[(sc, ind, "fig")] = f
@@ -979,37 +1059,55 @@ class ScenarioUI:
         ids = sorted(BASELINE_COUNTIES.keys())
         metric = self.map_metric.value
         if metric == "wage":
-            vals = [float(self.counties_p[c]["w_ell"]) * E_SCALE
-                    for c in ids]
-            lo, hi = min(vals), max(vals)
+            vals = {c: float(self.counties_p[c]["w_ell"]) * E_SCALE
+                    for c in ids}
+            finite = list(vals.values())
+            lo, hi = min(finite), max(finite)
         elif metric == "Pf (baseline)" and self.spatial_summary is not None:
             s = self.spatial_summary
-            vals = list(s["Pf"])
-            finite = [v for v in vals if np.isfinite(v)]
+            vals = {c: float(v) for c, v in zip(s["counties"], s["Pf"])}
+            finite = [v for v in vals.values() if np.isfinite(v)]
             lo, hi = (min(finite), max(finite)) if finite else (0, 1)
         elif metric == "ΔGDP (last CF)" and self.cf_summaries:
             last = list(self.cf_summaries.keys())[-1]
             base_gdp = self.spatial_summary["GDP"]
             new_gdp  = self.cf_summaries[last]["GDP"]
             with np.errstate(divide="ignore", invalid="ignore"):
-                vals = list(100.0 * (new_gdp / base_gdp - 1.0))
-            finite = [v for v in vals if np.isfinite(v)]
+                pct = 100.0 * (new_gdp / base_gdp - 1.0)
+            vals = {c: float(v)
+                    for c, v in zip(self.spatial_summary["counties"], pct)}
+            finite = [v for v in vals.values() if np.isfinite(v)]
             if finite:
                 m = max(abs(min(finite)), abs(max(finite))) or 1.0
                 lo, hi = -m, m
             else:
                 lo, hi = -1, 1
         else:
-            vals = [float(self.counties_p[c]["w_ell"]) * E_SCALE
-                    for c in ids]
-            lo, hi = min(vals), max(vals)
-        self.map_source.data = dict(
-            id=ids,
-            name=[COUNTY_NAMES[c] for c in ids],
-            lat =[BASELINE_COUNTIES[c]["lat"] for c in ids],
-            lon =[BASELINE_COUNTIES[c]["lon"] for c in ids],
-            value=vals,
-        )
+            vals = {c: float(self.counties_p[c]["w_ell"]) * E_SCALE
+                    for c in ids}
+            finite = list(vals.values())
+            lo, hi = min(finite), max(finite)
+
+        if COUNTY_GEOMETRY is not None:
+            # Patches-shaped: one row per polygon patch.  Look up the
+            # value for each patch's county_id.
+            patch_ids = COUNTY_GEOMETRY["id"]
+            self.map_source.data = dict(
+                xs   = list(COUNTY_GEOMETRY["xs"]),
+                ys   = list(COUNTY_GEOMETRY["ys"]),
+                id   = list(patch_ids),
+                name = list(COUNTY_GEOMETRY["name"]),
+                value= [vals.get(cid, float("nan")) for cid in patch_ids],
+            )
+        else:
+            # Centroid fallback
+            self.map_source.data = dict(
+                id=ids,
+                name=[COUNTY_NAMES[c] for c in ids],
+                lat =[BASELINE_COUNTIES[c]["lat"] for c in ids],
+                lon =[BASELINE_COUNTIES[c]["lon"] for c in ids],
+                value=[vals.get(c, float("nan")) for c in ids],
+            )
         self.map_color_mapper.low  = lo
         self.map_color_mapper.high = hi
 
@@ -1111,13 +1209,26 @@ class ScenarioUI:
                               ("dratio", dratio),
                               ("dN",   dN_pct)]:
                 src = self.cf_maps[(kind, ind)]
-                src.data = dict(
-                    id=ids,
-                    name=[COUNTY_NAMES[c] for c in ids],
-                    lat=[BASELINE_COUNTIES[c]["lat"] for c in ids],
-                    lon=[BASELINE_COUNTIES[c]["lon"] for c in ids],
-                    value=list(vec),
-                )
+                # Build a county_id -> value lookup
+                vmap = {c: float(v) for c, v in zip(ids, vec)}
+                if COUNTY_GEOMETRY is not None:
+                    patch_ids = COUNTY_GEOMETRY["id"]
+                    src.data = dict(
+                        xs   = list(COUNTY_GEOMETRY["xs"]),
+                        ys   = list(COUNTY_GEOMETRY["ys"]),
+                        id   = list(patch_ids),
+                        name = list(COUNTY_GEOMETRY["name"]),
+                        value= [vmap.get(cid, float("nan"))
+                                 for cid in patch_ids],
+                    )
+                else:
+                    src.data = dict(
+                        id=ids,
+                        name=[COUNTY_NAMES[c] for c in ids],
+                        lat=[BASELINE_COUNTIES[c]["lat"] for c in ids],
+                        lon=[BASELINE_COUNTIES[c]["lon"] for c in ids],
+                        value=list(vec),
+                    )
                 cm = self.cf_map_figs[(kind, ind, "cmap")]
                 finite = vec[np.isfinite(vec)]
                 if finite.size:
