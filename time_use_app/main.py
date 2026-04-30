@@ -521,7 +521,7 @@ class ScenarioUI:
     def _build_plots(self):
         # ----- Per-h tab plots ---------------------------------------- #
         # 1. Hours by gender × activity (8 lines)
-        p_hours = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_hours = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                           title="Hours per week by gender × activity")
         for col_, color, label in [
             ("LM_m",  "#1f77b4", "L^M man"),
@@ -543,7 +543,7 @@ class ScenarioUI:
         p_hours.legend.label_text_font_size = "7pt"
 
         # 2. Gender gaps (woman - man) for 4 activities
-        p_gap = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_gap = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                         title="Gender gap (woman − man), 4 activities")
         for col_, color, label in [
             ("gap_M",  "#1f77b4", "ΔL^M"),
@@ -559,7 +559,7 @@ class ScenarioUI:
         p_gap.legend.label_text_font_size = "7pt"
 
         # 3. PIGL expenditure shares (4 goods)
-        p_sh = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_sh = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                        title="PIGL expenditure shares (4 goods)")
         for col_, color, label in [
             ("th_xf", "#ff7f0e", "θ_xf (food)"),
@@ -575,7 +575,7 @@ class ScenarioUI:
         p_sh.legend.label_text_font_size = "7pt"
 
         # 4. Home/market expenditure shares (6 lines)
-        p_hm = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_hm = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                        title="Home vs market expenditure shares")
         for col_, color, dash, label in [
             ("SxfH", "#ff7f0e", "solid",  "Food home"),
@@ -594,7 +594,7 @@ class ScenarioUI:
         p_hm.legend.label_text_font_size = "7pt"
 
         # 5. Participation rates
-        p_part = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_part = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                          title="Participation rates P_m, P_f")
         p_part.line("h", "P_m", source=self.src_part,
                     color="#1f77b4", line_width=2, legend_label="P_m")
@@ -609,7 +609,7 @@ class ScenarioUI:
             p_hours, p_gap, p_sh, p_hm, p_part)
 
         # ----- Spatial summary plots ---------------------------------- #
-        p_vs = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width", title="V* vs wage")
+        p_vs = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width", title="V* vs wage")
         p_vs.scatter("wage", "Vstar", source=self.src_spatial,
                      size=8, fill_color="#1f77b4",
                      line_color="black", line_width=0.5)
@@ -619,7 +619,7 @@ class ScenarioUI:
                                             ("Wage","@wage{0}"),
                                             ("V*","@Vstar{0.000}")]))
 
-        p_xi = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_xi = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                        title="Amenity ξ ranking (highest → lowest)")
         p_xi.vbar(x="rank", top="xi", width=0.85, source=self.src_xi,
                   fill_color="color", line_color="black", line_width=0.3)
@@ -628,7 +628,7 @@ class ScenarioUI:
         p_xi.add_tools(HoverTool(tooltips=[("County","@name"),
                                             ("ξ","@xi{0.000}")]))
 
-        p_ratio = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_ratio = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                           title="Female/male market hours ratio")
         p_ratio.scatter("wage", "ratio", source=self.src_spatial, size=8,
                         fill_color="#d62728", line_color="black",
@@ -639,7 +639,7 @@ class ScenarioUI:
                                                ("Wage","@wage{0}"),
                                                ("ratio","@ratio{0.000}")]))
 
-        p_emp = figure(height=H_FIG, width=W_FIG, sizing_mode="stretch_width",
+        p_emp = figure(height=H_FIG, width=W_FIG, sizing_mode="scale_width",
                         title="Sectoral market employment by county",
                         x_range=[BASELINE_COUNTIES[c]["name"]
                                   for c in sorted(BASELINE_COUNTIES)])
