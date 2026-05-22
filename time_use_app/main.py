@@ -39,7 +39,7 @@ from bokeh.layouts import column, row, Spacer
 from bokeh.models import (
     Button, ColumnDataSource, Div, HoverTool, NumericInput,
     Select, Tabs, TabPanel, DataTable, TableColumn, NumberFormatter,
-    LinearColorMapper, ColorBar, BasicTicker,
+    LinearColorMapper, ColorBar, BasicTicker, Toggle,
 )
 from bokeh.plotting import figure
 from bokeh.palettes import RdBu11
@@ -407,6 +407,299 @@ def summarise_spatial(spatial: Dict[int, dict],
 
 
 # =========================================================================== #
+# Spatial-collapsed sweep helpers                                             #
+# =========================================================================== #
+#
+# Outcome variables tracked for each x-value in a sweep:
+#
+#   1. share_M_m, share_xf_m, share_c_m, share_d_m   — hour shares (sum=1) m
+#      share_M_f, share_xf_f, share_c_f, share_d_f   — hour shares (sum=1) f
+#   2. L_total_m, L_total_f                          — total raw hours per gender
+#   3. P_m, P_f                                       — labor force participation
+#   4. th_xf, th_xn, th_c, th_d                       — PIGL expenditure shares
+#   5. rel_p_xf, rel_p_c, rel_p_d                     — p^i / p^xn (= w / A^{M,i})
+#   6. ScM_share                                      — market share of care
+#   7. SdM_share                                      — market share of domestic
+#   8. GDP                                            — sum_i p^i · Y^i  (market)
+#   9. total_activity                                 — GDP + value of home output
+#
+# In "collapsed" mode we build one aggregate household with population-weighted
+# primitives.  In "heterogeneous" mode we sweep all 47 counties at each x-value
+# and population-average the outputs.
+# =========================================================================== #
+
+# The 9 primitives we let the user sweep.  Each tuple is
+# (key, label, target).  'target' is 'mp' (multiplies the ModelParams field
+# of the same name) or 'county' (multiplies the County field of the same
+# name).  TFPs live on counties; D weights on mp.
+SWEEP_PRIMITIVES = [
+    # Grouped sweeps — scale every member uniformly by x.
+    ("ALL_A", "All TFPs  (A^{M,xf}, A^{M,xn}, A^{M,c}, A^{M,d})", "group_A"),
+    ("ALL_D", "All D weights (5 non-trivial disutilities)",        "group_D"),
+    # Individual TFPs (multiplicative on the county-level AM_*)
+    ("AM_xf", "A^{M,xf}  (food TFP)",      "county"),
+    ("AM_xn", "A^{M,xn}  (non-food TFP)",  "county"),
+    ("AM_c",  "A^{M,c}   (care TFP)",       "county"),
+    ("AM_d",  "A^{M,d}   (domestic TFP)",   "county"),
+    # Individual disutility weights (multiplicative on the mp.D_*)
+    ("D_M_f", "D^M_f   (female market disutility)",   "mp"),
+    ("D_xf_f","D^xf_f  (female food-prep disutility)","mp"),
+    ("D_c_f", "D^c_f   (female care disutility)",     "mp"),
+    ("D_d_m", "D^d_m   (male domestic disutility)",   "mp"),
+    ("D_d_f", "D^d_f   (female domestic disutility)", "mp"),
+]
+SWEEP_KEYS_BY_LABEL = {lab: key for key, lab, _ in SWEEP_PRIMITIVES}
+
+
+# The 9 panels of the sweep tab and which outcome keys each panel plots.
+# Order of keys controls the legend order.  Colours are assigned in the
+# figure builder.
+OUTCOMES_KEYS = {
+    "Hour shares — men":   ["share_M_m", "share_xf_m", "share_c_m", "share_d_m"],
+    "Hour shares — women": ["share_M_f", "share_xf_f", "share_c_f", "share_d_f"],
+    "Total hours":         ["L_total_m", "L_total_f"],
+    "Participation":       ["P_m", "P_f"],
+    "Expenditure shares":  ["th_xf", "th_xn", "th_c", "th_d"],
+    "Relative prices":     ["rel_p_xf", "rel_p_c", "rel_p_d"],
+    "Care: market share":  ["ScM_share"],
+    "Domestic: market share": ["SdM_share"],
+    "GDP & total activity":["GDP", "total_activity"],
+}
+
+# Colours per outcome key (one fixed colour per series)
+OUTCOMES_COLORS = {
+    "share_M_m":"#1f77b4","share_xf_m":"#ff7f0e","share_c_m":"#2ca02c","share_d_m":"#d62728",
+    "share_M_f":"#1f77b4","share_xf_f":"#ff7f0e","share_c_f":"#2ca02c","share_d_f":"#d62728",
+    "L_total_m":"#1f77b4","L_total_f":"#d62728",
+    "P_m":"#1f77b4","P_f":"#d62728",
+    "th_xf":"#1f77b4","th_xn":"#ff7f0e","th_c":"#2ca02c","th_d":"#d62728",
+    "rel_p_xf":"#1f77b4","rel_p_c":"#2ca02c","rel_p_d":"#d62728",
+    "ScM_share":"#2ca02c","SdM_share":"#d62728",
+    "GDP":"#1f77b4","total_activity":"#d62728",
+}
+
+
+def _aggregate_household_primitives(global_p, counties_p):
+    """Build a single aggregate (mp, county_dict) from population-weighted means.
+
+    Mean is over the 47 counties' primitives weighted by N.  Used as the
+    'collapsed' representative-household input.
+    """
+    cids = sorted(counties_p.keys())
+    Ns = np.array([counties_p[c]["N"] for c in cids], dtype=float)
+    W  = Ns / Ns.sum()
+
+    def wm(key):  # population-weighted mean of a county field
+        return float(np.sum(W * np.array(
+            [counties_p[c][key] for c in cids], dtype=float)))
+
+    agg_cp = {
+        "county_id": 0,
+        "name": "Aggregate (pop-weighted)",
+        "lat": 0.0, "lon": 0.0,
+        "w_ell": wm("w_ell"),
+        "p_xf":  wm("p_xf"),
+        "pc":    wm("pc"),
+        "pd":    wm("pd"),
+        "AM_xn": wm("AM_xn"),
+        "AM_xf": wm("AM_xf"),
+        "AM_c":  wm("AM_c"),
+        "AM_d":  wm("AM_d"),
+        "A_xf_home": wm("A_xf_home"),
+        "A_c_home":  wm("A_c_home"),
+        "A_d_home":  wm("A_d_home"),
+        "N":     float(Ns.sum()),
+        "D_M_m": wm("D_M_m"),
+        "D_xf_m":wm("D_xf_m"),
+        "D_c_m": wm("D_c_m"),
+        "D_d_m": wm("D_d_m"),
+        "D_M_f": wm("D_M_f"),
+        "D_xf_f":wm("D_xf_f"),
+        "D_c_f": wm("D_c_f"),
+        "D_d_f": wm("D_d_f"),
+    }
+    return agg_cp
+
+
+def _extract_outcomes(hh, P_m, P_f, county) -> dict:
+    """Pull the 9 outcomes out of a converged (1,1) household + participation.
+
+    `county` is the County object used for the solve; we read AM_* / N from
+    it to compute GDP and total activity.
+    """
+    # Total raw hours per gender (sum of the four activity hours)
+    L_total_m = hh.LM_m + hh.Lxf_m + hh.Lc_m + hh.Ld_m
+    L_total_f = hh.LM_f + hh.Lxf_f + hh.Lc_f + hh.Ld_f
+    # Hour shares per gender (sum to 1)
+    def _safe(x, tot):
+        return float(x / tot) if tot > 0 else float("nan")
+    share_m = (_safe(hh.LM_m, L_total_m), _safe(hh.Lxf_m, L_total_m),
+                _safe(hh.Lc_m, L_total_m), _safe(hh.Ld_m, L_total_m))
+    share_f = (_safe(hh.LM_f, L_total_f), _safe(hh.Lxf_f, L_total_f),
+                _safe(hh.Lc_f, L_total_f), _safe(hh.Ld_f, L_total_f))
+
+    # Relative prices.  p_xn = 1 (numeraire).
+    rel_p_xf = float(hh.p_xf)
+    rel_p_c  = float(hh.pc)
+    rel_p_d  = float(hh.pd)
+
+    # CES split shares of market consumption for care and domestic.
+    # By envelope: ScM_share = p_c * S_cM / (P_c * S_c)
+    if hh.Pc > 0 and hh.Sc > 0:
+        ScM_share = (hh.pc * hh.ScM) / (hh.Pc * hh.Sc)
+    else:
+        ScM_share = float("nan")
+    if hh.Pd > 0 and hh.Sd > 0:
+        SdM_share = (hh.pd * hh.SdM) / (hh.Pd * hh.Sd)
+    else:
+        SdM_share = float("nan")
+
+    # GDP: market output at market prices.  L^{M,i} in efficiency hours,
+    # p^i in same units; Y^i = A^{M,i} · L^{M,i}; revenue = p^i · Y^i.
+    N = float(county.N)
+    LM_xf = N * hh.SxfM / max(county.AM_xf, 1e-12)
+    LM_c  = N * hh.ScM  / max(county.AM_c,  1e-12)
+    LM_d  = N * hh.SdM  / max(county.AM_d,  1e-12)
+    # Labour-market residual for non-food.  Note: efficiency-hour weighting.
+    total_eff = N * (hh.LM_m + hh.params.wage_gap * hh.LM_f)
+    LM_xn = total_eff - (LM_xf + LM_c + LM_d)
+    GDP = (hh.p_xf * county.AM_xf * LM_xf
+         + 1.0     * county.AM_xn * max(LM_xn, 0.0)
+         + hh.pc   * county.AM_c  * LM_c
+         + hh.pd   * county.AM_d  * LM_d)
+
+    # Total economic activity = GDP + value of home output at shadow prices.
+    home_value = (hh.PxfH * hh.SxfH + hh.PcH * hh.ScH + hh.PdH * hh.SdH) * N
+    total_activity = GDP + home_value
+
+    return dict(
+        share_M_m=share_m[0],  share_xf_m=share_m[1],
+        share_c_m=share_m[2],  share_d_m=share_m[3],
+        share_M_f=share_f[0],  share_xf_f=share_f[1],
+        share_c_f=share_f[2],  share_d_f=share_f[3],
+        L_total_m=L_total_m,   L_total_f=L_total_f,
+        P_m=P_m, P_f=P_f,
+        th_xf=hh.th_xf, th_xn=hh.th_xn, th_c=hh.th_c, th_d=hh.th_d,
+        rel_p_xf=rel_p_xf, rel_p_c=rel_p_c, rel_p_d=rel_p_d,
+        ScM_share=float(ScM_share),
+        SdM_share=float(SdM_share),
+        GDP=float(GDP),
+        total_activity=float(total_activity),
+    )
+
+
+def _apply_sweep_scaling(cp, primitive_key, target, x):
+    """Apply the scaling x to one (or a group of) primitive(s) on the
+    county dict `cp`.  Recomputes prices via free entry if any TFP moved.
+    Mutates and returns `cp`.
+    """
+    if target == "county":
+        cp[primitive_key] = cp[primitive_key] * x
+        # Recompute via eq. (29)-(30): w = A^{M,xn}, p^i = w / A^{M,i}
+        cp["w_ell"] = cp["AM_xn"]
+        cp["p_xf"]  = cp["w_ell"] / max(cp["AM_xf"], 1e-12)
+        cp["pc"]    = cp["w_ell"] / max(cp["AM_c"],  1e-12)
+        cp["pd"]    = cp["w_ell"] / max(cp["AM_d"],  1e-12)
+    elif target == "mp":
+        cp[primitive_key] = cp[primitive_key] * x
+    elif target == "group_A":
+        for k in ("AM_xf", "AM_xn", "AM_c", "AM_d"):
+            cp[k] = cp[k] * x
+        cp["w_ell"] = cp["AM_xn"]
+        cp["p_xf"]  = cp["w_ell"] / max(cp["AM_xf"], 1e-12)
+        cp["pc"]    = cp["w_ell"] / max(cp["AM_c"],  1e-12)
+        cp["pd"]    = cp["w_ell"] / max(cp["AM_d"],  1e-12)
+    elif target == "group_D":
+        for k in ("D_M_f", "D_xf_f", "D_c_f", "D_d_m", "D_d_f"):
+            cp[k] = cp[k] * x
+    return cp
+
+
+def _solve_aggregate_at_scale(global_p, counties_p, primitive_key, x):
+    """Solve the aggregate household with one primitive (or a group)
+    scaled by x.  Returns extracted outcomes, or None if the solve fails.
+    """
+    agg_cp = _aggregate_household_primitives(global_p, counties_p)
+    target = next(t for k, _, t in SWEEP_PRIMITIVES if k == primitive_key)
+    agg_cp = _apply_sweep_scaling(agg_cp, primitive_key, target, x)
+    mp_local  = _county_specific_mp(global_p, agg_cp)
+    cty_local = _build_county(agg_cp, 0, mp_local)
+    try:
+        res = solve_county_household(cty_local, mp_local, 1.0, 1.0, a=0.2)
+    except Exception:
+        return None
+    if not res["conv11"]:
+        return None
+    return _extract_outcomes(res["hh11"], res["P_m"], res["P_f"], cty_local)
+
+
+def _solve_heterogeneous_at_scale(global_p, counties_p, primitive_key, x):
+    """Solve all 47 counties with `primitive_key` scaled by `x` (uniformly
+    across counties).  Population-weighted average outcomes returned.
+    """
+    target = next(t for k, _, t in SWEEP_PRIMITIVES if k == primitive_key)
+    cids = sorted(counties_p.keys())
+
+    outs = []
+    weights = []
+    for cid in cids:
+        cp_local = dict(counties_p[cid])
+        cp_local = _apply_sweep_scaling(cp_local, primitive_key, target, x)
+        mp_local = _county_specific_mp(global_p, cp_local)
+        cty_local = _build_county(cp_local, cid, mp_local)
+        try:
+            res = solve_county_household(cty_local, mp_local, 1.0, 1.0, a=0.2)
+        except Exception:
+            continue
+        if not res["conv11"]:
+            continue
+        outs.append(_extract_outcomes(res["hh11"], res["P_m"], res["P_f"],
+                                       cty_local))
+        weights.append(float(cp_local["N"]))
+
+    if not outs:
+        return None
+    W = np.array(weights); W = W / W.sum()
+    keys = list(outs[0].keys())
+    return {k: float(np.sum([W[i] * outs[i][k] for i in range(len(outs))]))
+            for k in keys}
+
+
+def _run_sweep(global_p, counties_p, primitive_key, x_values,
+                use_heterogeneous):
+    """Run a sweep over x_values; return dict of {outcome_key: array of values}.
+
+    Output arrays have the same length as x_values; entries are NaN where
+    the solve failed.
+    """
+    rows = []
+    for x in x_values:
+        if use_heterogeneous:
+            out = _solve_heterogeneous_at_scale(global_p, counties_p,
+                                                  primitive_key, float(x))
+        else:
+            out = _solve_aggregate_at_scale(global_p, counties_p,
+                                              primitive_key, float(x))
+        rows.append(out)
+
+    # Pivot: rows is list-of-dicts; result is dict-of-arrays.
+    keys = None
+    for r in rows:
+        if r is not None:
+            keys = list(r.keys())
+            break
+    if keys is None:
+        return None
+    out = {k: np.full(len(x_values), np.nan) for k in keys}
+    for i, r in enumerate(rows):
+        if r is None:
+            continue
+        for k, v in r.items():
+            out[k][i] = v
+    return out
+
+
+# =========================================================================== #
 # UI factory                                                                  #
 # =========================================================================== #
 
@@ -563,6 +856,46 @@ class ScenarioUI:
                 title=lab,
                 value=float(self.counties_p[self.selected_county][k]),
                 mode="float", width=130)
+
+        # ----- Spatial-collapsed sweep widgets ------------------------ #
+        sweep_labels = [lab for _, lab, _ in SWEEP_PRIMITIVES]
+        self.sweep_select = Select(title="Sweep primitive:",
+                                    value=sweep_labels[0],
+                                    options=sweep_labels, width=420)
+        self.sweep_decollapse = Toggle(
+            label="Heterogeneous mode (off = aggregate)",
+            active=False, width=320)
+        self.sweep_btn = Button(label="Run sweep",
+                                 button_type="primary", width=140)
+        self.sweep_help = Div(width=900, text=(
+            "<div style='font-size:90%; color:#555; margin:4px 0'>"
+            "<b>How this works.</b> A sweep multiplies the chosen primitive "
+            "by <code>x ∈ [0.75, 1.25]</code> and re-solves the model at "
+            "each value of <code>x</code>.  TFP sweeps additionally trigger "
+            "free-entry price recomputation (eq. 29–30); D-weight sweeps "
+            "leave prices unchanged."
+            "<br><br>"
+            "<b>Aggregate mode</b> (toggle OFF, default): builds a single "
+            "representative household whose primitives are the population-"
+            "weighted means across the 47 counties.  11 x-points, ~2 s."
+            "<br>"
+            "<b>Heterogeneous mode</b> (toggle ON): multiplies the primitive "
+            "uniformly across all 47 counties (e.g. every county's "
+            "<code>A^{M,c}</code> goes up 25% at <code>x = 1.25</code>), "
+            "re-solves all 47 counties, and population-averages the outcomes.  "
+            "Captures Jensen-inequality and interaction effects that the "
+            "aggregate misses, at the cost of running 47× more solves.  "
+            "5 x-points, ~50 s."
+            "</div>"))
+        self.sweep_status = Div(
+            text="<i>Click 'Run sweep' to compute comparative statics.</i>",
+            width=900)
+        # One ColumnDataSource per outcome panel
+        self.sweep_sources = {
+            name: ColumnDataSource(data=dict(x=[], **{k: []
+                for k in OUTCOMES_KEYS[name]}))
+            for name in OUTCOMES_KEYS
+        }
 
     # ------------------------------------------------------------------ #
     # Plots                                                              #
@@ -809,6 +1142,30 @@ class ScenarioUI:
                 self.cf_map_figs[(sc, ind, "fig")] = f
                 self.cf_map_figs[(sc, ind, "cmap")] = cm
 
+        # ----- Sweep tab plots (3 × 3 grid) --------------------------- #
+        # Each panel shows one or more outcomes as functions of the
+        # multiplicative sweep on the chosen primitive.  X-axis label is
+        # set dynamically when a sweep runs (it reflects the chosen
+        # primitive's label).  Legends are placed outside the plot area
+        # (right) so series don't occlude the lines.
+        self.sweep_figs = {}
+        for panel_title, keys in OUTCOMES_KEYS.items():
+            f = figure(height=320, width=320, title=panel_title,
+                        toolbar_location=None)
+            f.xaxis.axis_label = "x  (multiplicative on primitive)"
+            for k in keys:
+                f.line("x", k, source=self.sweep_sources[panel_title],
+                        color=OUTCOMES_COLORS.get(k, "#444"),
+                        line_width=2, legend_label=k)
+            # Move legend outside to the right; this requires placing the
+            # legend before adding it as a layout to the figure.
+            new_legend = f.legend[0]
+            new_legend.label_text_font_size = "8pt"
+            new_legend.click_policy = "hide"
+            new_legend.border_line_alpha = 0
+            f.add_layout(new_legend, "right")
+            self.sweep_figs[panel_title] = f
+
     # ------------------------------------------------------------------ #
     # Layout                                                             #
     # ------------------------------------------------------------------ #
@@ -840,7 +1197,20 @@ class ScenarioUI:
             *cf_grid_rows,
         ), title="Counterfactuals")
 
-        self.tabs = Tabs(tabs=[tab1, tab2, tab3])
+        # Tab 4: spatial-collapsed sweep (3×3 grid of outcome panels)
+        panel_titles = list(OUTCOMES_KEYS.keys())
+        sweep_rows = []
+        for i in range(0, 9, 3):
+            sweep_rows.append(row(*[self.sweep_figs[t]
+                                     for t in panel_titles[i:i+3]]))
+        tab4 = TabPanel(child=column(
+            row(self.sweep_select, self.sweep_decollapse, self.sweep_btn),
+            self.sweep_help,
+            self.sweep_status,
+            *sweep_rows,
+        ), title="Spatial-collapsed sweeps")
+
+        self.tabs = Tabs(tabs=[tab1, tab2, tab3, tab4])
 
         # Parameter blocks (two-per-row), each with an explicit width=380 so
         # the controls column has a definite size and never collapses.
@@ -911,6 +1281,7 @@ class ScenarioUI:
         self.cf_btn_pd.on_click(lambda: self._run_cf("pd"))
         self.map_metric.on_change("value",
                                    lambda attr, old, new: self._refresh_map())
+        self.sweep_btn.on_click(self._run_sweep)
 
     def _select_county(self, cnum: int):
         # Save the current county_inputs before switching
@@ -1245,6 +1616,54 @@ class ScenarioUI:
                 dratio=[r["dratio"] for r in rows],
                 dN  =[r["dN"]   for r in rows],
             )
+
+    def _run_sweep(self):
+        """Run a comparative-statics sweep on the chosen primitive."""
+        label = self.sweep_select.value
+        key   = SWEEP_KEYS_BY_LABEL[label]
+        use_het = bool(self.sweep_decollapse.active)
+
+        # X-grid: 11 points (collapsed) or 5 (heterogeneous).
+        n_pts = 5 if use_het else 11
+        x_values = np.linspace(0.75, 1.25, n_pts)
+        mode_text = ("heterogeneous, 47 counties × " + str(n_pts) +
+                      " x-points (~50 s)" if use_het
+                      else "aggregate household, " + str(n_pts) +
+                      " x-points (~2 s)")
+        self.sweep_status.text = (
+            f"<i>Running sweep on <b>{label}</b> — {mode_text}…</i>")
+
+        # Sync current parameter edits to state first
+        self._sync_inputs_to_state()
+        self._sync_inputs_to_county(self.selected_county)
+
+        out = _run_sweep(self.global_p, self.counties_p, key,
+                          x_values, use_het)
+        if out is None:
+            self.sweep_status.text = (
+                f"<i style='color:red'>Sweep failed: no county converged on "
+                f"any x-value for <b>{label}</b>.</i>")
+            return
+
+        # Push results into the per-panel data sources, with the sweep
+        # primitive's label as the x-axis name.
+        for panel_title, keys in OUTCOMES_KEYS.items():
+            src_data = dict(x=list(x_values))
+            for k in keys:
+                src_data[k] = list(out.get(k, np.full(len(x_values), np.nan)))
+            self.sweep_sources[panel_title].data = src_data
+            # Update x-axis label to mention the primitive
+            self.sweep_figs[panel_title].xaxis.axis_label = (
+                f"x  (scales {label})")
+
+        # Diagnostics: count NaN entries
+        n_failed = int(np.sum(~np.isfinite(out.get("GDP",
+            np.full(len(x_values), np.nan)))))
+        suffix = "" if n_failed == 0 else f" ({n_failed} x-points failed)"
+        self.sweep_status.text = (
+            f"Sweep complete: <b>{label}</b>, "
+            f"{'heterogeneous' if use_het else 'collapsed aggregate'}, "
+            f"{n_pts} x-points{suffix}.")
 
 
 # =========================================================================== #
